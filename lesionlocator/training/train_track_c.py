@@ -1,7 +1,6 @@
 import itertools
 import multiprocessing
 import os
-import sys
 import gc
 import traceback
 import json
@@ -578,92 +577,7 @@ class LesionLocatorTrack(object):
         if isinstance(use_folds, str):
              use_folds = [use_folds]
 
-        # parameters = []
-        # for i, f in enumerate(use_folds):
-        #     f = int(f) if f != 'all' else f
-        #     checkpoint = torch.load(join(model_training_output_dir, f'fold_{f}', checkpoint_name),
-        #                             map_location=torch.device('cpu'), weights_only=False)
-        #     if i == 0:
-        #         trainer_name = checkpoint['trainer_name']
-        #         configuration_name = checkpoint['init_args']['configuration']
-                
-        #         # Enhanced configuration mapping for better compatibility
-        #         original_config = configuration_name
-        #         if configuration_name == '3d_fullres_bs3':
-        #             configuration_name = '3d_fullres'
-        #             print(f"Warning: Mapped {original_config} to {configuration_name}")
-        #         elif configuration_name not in plans_manager.plans.get('configurations', {}):
-        #             # Try common fallback mappings
-        #             fallback_mappings = {
-        #                 '3d_fullres_bs2': '3d_fullres',
-        #                 '3d_fullres_bs4': '3d_fullres', 
-        #                 '3d_fullres_bs8': '3d_fullres',
-        #                 '3d_lowres': '3d_fullres',
-        #                 '2d_bs3': '2d',
-        #                 '2d_bs2': '2d'
-        #             }
-        #             if configuration_name in fallback_mappings:
-        #                 new_config = fallback_mappings[configuration_name]
-        #                 if new_config in plans_manager.plans.get('configurations', {}):
-        #                     configuration_name = new_config
-        #                     print(f"Warning: Mapped {original_config} to {configuration_name}")
-        #                 else:
-        #                     print(f"Error: Neither {original_config} nor {new_config} found in plans")
-        #                     print(f"Available configurations: {list(plans_manager.plans.get('configurations', {}).keys())}")
-        #             else:
-        #                 print(f"Error: Configuration {configuration_name} not found in plans")
-        #                 print(f"Available configurations: {list(plans_manager.plans.get('configurations', {}).keys())}")
-                
-        #         inference_allowed_mirroring_axes = checkpoint['inference_allowed_mirroring_axes'] if \
-        #             'inference_allowed_mirroring_axes' in checkpoint.keys() else None
-
-        #     # load previous fine-tuned model
-        #     if os.path.exists(join(model_training_output_dir, f'fold_{f}', 'best_model.pth')):
-        #         print(f'Loading fold {f} best model for segmentation')
-        #         checkpoint = torch.load(join(model_training_output_dir, f'fold_{f}', 'best_model.pth'),
-        #                     map_location=torch.device('cpu'), weights_only=False)
-
-        #     parameters.append(checkpoint['network_weights'])
-
-        # # self.configuration_name = configuration_name
-        # configuration_manager = plans_manager.get_configuration(configuration_name, modality=modality)
-        # configuration_manager.set_preprocessor_name('TrainingPreprocessor')
-
-        # # restore network
-        # num_input_channels = determine_num_input_channels(plans_manager, configuration_manager, dataset_json)
-        # trainer_class = recursive_find_python_class(join(lesionlocator.__path__[0], "training", "LesionLocatorTrainer"),
-        #                                             trainer_name, 'lesionlocator.training.LesionLocatorTrainer')
-        # if trainer_class is None:
-        #     raise RuntimeError(f'Unable to locate trainer class {trainer_name} in lesionlocator.training.LesionLocatorTrainer. '
-        #                        f'Please place it there (in any .py file)!')
-        # network = trainer_class.build_network_architecture(
-        #     configuration_manager.network_arch_class_name,
-        #     configuration_manager.network_arch_init_kwargs,
-        #     configuration_manager.network_arch_init_kwargs_req_import,
-        #     num_input_channels,
-        #     plans_manager.get_label_manager(dataset_json).num_segmentation_heads,
-        #     enable_deep_supervision=False
-        # )
-
-        # self.plans_manager = plans_manager
-        # self.configuration_manager = configuration_manager
-        # self.list_of_parameters = parameters
-        
-        # # Store configuration name for checkpoint saving
-        # self.configuration_name = configuration_name
-
-        # network.load_state_dict(parameters[0])
-        
-        # self.network = network
-        # self.trainer_name = trainer_name
-        # self.allowed_mirroring_axes = inference_allowed_mirroring_axes
-        # self.label_manager = plans_manager.get_label_manager(dataset_json)
-        # if ('LesionLocator_compile' in os.environ.keys()) and (os.environ['LesionLocator_compile'].lower() in ('true', '1', 't')) \
-        #         and not isinstance(self.network, OptimizedModule):
-        #     print('Using torch.compile')
-        #     self.network = torch.compile(self.network)
-
-        #Tracker network
+        # Tracker network
         dataset_json_tracker = load_json(join(model_track_training_output_dir, 'dataset.json'))
         plans_tracker = load_json(join(model_track_training_output_dir, 'plans.json'))
         plans_manager_tracker = PlansManager(plans_tracker)
@@ -763,9 +677,6 @@ class LesionLocatorTrack(object):
         self.trainer_name_tracker = trainer_name_tracker
         self.allowed_mirroring_axes = inference_allowed_mirroring_axes
         self.label_manager = plans_manager_tracker.get_label_manager(dataset_json_tracker)
-        self.tile_step_size = 0.5
-        self.use_gaussian = True
-        self.use_mirroring = True
         # For LesionLocatorTrack, always use tracker spacing
         self.target_spacing = self.configuration_manager_tracker.spacing
         print('Using target spacing: ', self.target_spacing)
@@ -1380,8 +1291,11 @@ class LesionLocatorTrack(object):
             print(f"Starting: {fold_idx + 1}/{n_folds}")
             print(f"{'='*50}")
             
-            # Reset network weights for each fold (reload from checkpoint)
-            self.network.load_state_dict(self.list_of_parameters[0])
+            # Reset network weights for each fold (reload from checkpoint).
+            # Prefer fold-specific weights when an ensemble of checkpoints has been loaded;
+            # fall back to index 0 when only a single pretrained snapshot is available.
+            init_idx = fold_idx if fold_idx < len(self.list_of_parameters) else 0
+            self.network.load_state_dict(self.list_of_parameters[init_idx])
             
             # Train this fold
             fold_results = self.train_cv_fold(
@@ -1491,28 +1405,28 @@ class LesionLocatorTrack(object):
         self.setup_training(learning_rate=lr, finetune_mode=finetune_mode)
         self.network.to(device)
         
-        # Create DataLoaders
+        # Create DataLoaders. num_workers comes from --num_workers (default 0).
         train_dataloader = DataLoader(
             train_dataset,
             batch_size=batch_size,
             collate_fn=training_collate_fn,
-            num_workers=0,
+            num_workers=num_workers,
         )
-        
+
         val_dataloader = DataLoader(
             val_dataset,
             batch_size=batch_size,
             collate_fn=training_collate_fn,
-            num_workers=0,
+            num_workers=num_workers,
         )
-        
+
         test_dataloader = None
         if test_dataset is not None:
             test_dataloader = DataLoader(
                 test_dataset,
                 batch_size=batch_size,
                 collate_fn=training_collate_fn,
-                num_workers=0,
+                num_workers=num_workers,
             )
         
         # Training history for this fold
@@ -1571,17 +1485,17 @@ class LesionLocatorTrack(object):
                         prompt = prompt.unsqueeze(0)
                         target = target.unsqueeze(0)
                     
-                    combined_input = torch.cat([data, prompt], dim=1)  
-                    
+                    combined_input = torch.cat([data, prompt], dim=1)
+
                     self.optimizer.zero_grad()
 
                     with _autocast_context(device):
                         outputs = self.network(combined_input)
                         loss = self.loss_function(outputs, target)
 
-                    self.optimizer.zero_grad()
-                    loss.backward()
-                    self.optimizer.step()
+                    self.scaler.scale(loss).backward()
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
                                         
                     epoch_train_loss += loss.item()
                     num_train_batches += 1
@@ -1594,9 +1508,9 @@ class LesionLocatorTrack(object):
                         print(f"  GPU memory reserved: {_cuda_memory_reserved_gb(device):.2f} GB")
                         
                 except Exception as e:
-                    import sys
                     print(f"Error in training batch {batch_idx}: {e}")
-                    sys.exit(1)
+                    _maybe_empty_cache(device)
+                    continue
 
             avg_train_loss = epoch_train_loss / max(num_train_batches, 1)
             fold_train_losses.append(avg_train_loss)
@@ -1632,9 +1546,9 @@ class LesionLocatorTrack(object):
                         _maybe_empty_cache(device)
                     
                     except Exception as e:
-                        import sys
                         print(f"Error in validation batch {batch_idx}: {e}")
-                        sys.exit(1)
+                        _maybe_empty_cache(device)
+                        continue
 
             avg_val_loss = epoch_val_loss / max(num_val_batches, 1)
             fold_val_losses.append(avg_val_loss)
@@ -1694,7 +1608,8 @@ class LesionLocatorTrack(object):
                             _maybe_empty_cache(device)
                         except Exception as e:
                             print(f"Error in test batch {batch_idx}: {e}")
-                            sys.exit(1)
+                            _maybe_empty_cache(device)
+                            continue
 
                 avg_test_dice = np.mean(epoch_test_dice_scores) if epoch_test_dice_scores else 0.0
                 fold_test_dice_scores.append(avg_test_dice)
@@ -1828,8 +1743,8 @@ class LesionLocatorTrack(object):
         Training function for tracking model using paired baseline and follow-up data.
         
         Args:
-            train_dataset: LesionTrackingDatasetWrapper for training data
-            val_dataset: LesionTrackingDatasetWrapper for validation data (optional)
+            train_dataset: iterable tracking dataset for training data
+            val_dataset: iterable tracking dataset for validation data (optional)
             test_dataset: Dataset for test evaluation (optional)
             epochs: Number of training epochs
             batch_size: Batch size (typically 1 for tracking due to memory constraints)
@@ -1849,23 +1764,26 @@ class LesionLocatorTrack(object):
         # Move tracking network to device
         self.network_tracker.to(device)
         
-        # Create DataLoaders with tracking collate function
+        # Create DataLoaders with tracking collate function.
+        # Preprocessing is already parallelised via the external iterator (-npp);
+        # DataLoader workers are therefore usually 0. Honour the caller's choice
+        # so users can opt into extra loader workers when running with -npp 0.
         train_dataloader = DataLoader(
             train_dataset,
             batch_size=batch_size,
             collate_fn=tracking_collate_fn,
-            num_workers=0  # Use 0 since we handle multiprocessing internally
+            num_workers=num_workers
         )
-        
+
         val_dataloader = None
         if val_dataset is not None:
             val_dataloader = DataLoader(
                 val_dataset,
                 batch_size=1, # can only be 1 for validation
                 collate_fn=tracking_collate_fn,
-                num_workers=0
+                num_workers=num_workers
             )
-        
+
 
         test_dataloader = None
         if test_dataset is not None:
@@ -1873,7 +1791,7 @@ class LesionLocatorTrack(object):
                 test_dataset,
                 batch_size=1,
                 collate_fn=tracking_collate_fn,
-                num_workers=0
+                num_workers=num_workers
             )
         
         # Training history
@@ -2467,8 +2385,10 @@ def train_from_prompt():
     parser.add_argument('-m', type=str, required=True,
                         help='Folder of the LesionLocator model called "LesionLocatorCheckpoint"')
     parser.add_argument('-f', nargs='+', type=str, required=False, default=(0, 1, 2, 3, 4),
-                        help='Specify the folds of the trained model that should be used for prediction. '
-                             'Default: (0, 1, 2, 3, 4)')
+                        help='Folds of the pretrained LesionLocator checkpoint to load for the '
+                             'tracker\'s initial weights (ensemble init). Pass a single fold (e.g. '
+                             '"-f 0") for a fast smoke test. This is NOT the CV training fold — '
+                             'use --train_fold for that. Default: (0, 1, 2, 3, 4)')
     parser.add_argument('-step_size', type=float, required=False, default=0.5,
                         help='Step size for sliding window prediction. The larger it is the faster but less accurate '
                              'the prediction. Default: 0.5. Cannot be larger than 1. We recommend the default.')
@@ -2508,8 +2428,10 @@ def train_from_prompt():
                         help='Batch size for training. Default: 3')
     parser.add_argument('--gradient_accumulation_steps', type=int, required=False, default=1,
                         help='Number of steps to accumulate gradients before updating. Effective batch size = batch_size * gradient_accumulation_steps. Default: 1')
-    parser.add_argument('--num_workers', type=int, required=False, default=4,
-                        help='Number of workers for data loading. Default: 4')
+    parser.add_argument('--num_workers', type=int, required=False, default=0,
+                        help='Number of DataLoader workers. Kept at 0 by default because preprocessing is '
+                             'already parallelised via -npp; non-zero values will spawn extra worker '
+                             'processes on top of the preprocessing pool. Default: 0')
     parser.add_argument('--ckpt_path', type=str, required=False, default=None,
                         help='Path to save inference-compatible checkpoints. Will create LesionLocatorSeg/point_optimized/fold_X structure. Default: None (no inference checkpoints saved)')
     parser.add_argument('--finetune', type=str, required=False, default='all', choices=['reg_net', 'unet', 'all'],
@@ -2718,7 +2640,7 @@ def train_from_prompt():
         lr=args.lr,
         device=device,
         output_folder=args.o,
-        num_workers=0,  # Set to 0 for tracking
+        num_workers=args.num_workers,
         finetune_mode=args.finetune,
         # gradient_accumulation_steps=args.gradient_accumulation_steps
     )

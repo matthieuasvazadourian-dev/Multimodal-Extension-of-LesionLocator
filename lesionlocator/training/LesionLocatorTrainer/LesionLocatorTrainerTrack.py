@@ -34,6 +34,9 @@ class LesionLocatorTrainerTrack():
         #     max(128, int(patch_size[1] * 1.5)),  # Y: 128 is standard minimum
         #     max(128, int(patch_size[2] * 1.5))   # X: 128 is standard minimum
         # ]
+        # UniGradICON is trained and distributed with a fixed 175^3 input grid; do not
+        # derive this from patch_size — changing it requires re-training the registration
+        # backbone. Keep this literal unless the upstream UniGradICON checkpoint changes.
         reg_input_shape = [1, 1, 175, 175, 175]
         reg_net = make_network(reg_input_shape, include_last_step=True)
 

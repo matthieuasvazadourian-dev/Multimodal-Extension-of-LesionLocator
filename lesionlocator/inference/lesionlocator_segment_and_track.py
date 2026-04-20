@@ -55,7 +55,9 @@ class LesionLocatorSegmenter(object):
                  visualize: bool = False,
                  track: bool = False,
                  adaptive_mode: bool = False,
-                 empty_prompt: bool = False):
+                 empty_prompt: bool = False,
+                 tune_cuda_globals: bool = False,
+                 cuda_memory_fraction: float = None):
         self.verbose = verbose
         self.verbose_preprocessing = verbose_preprocessing
         self.allow_tqdm = allow_tqdm
@@ -67,29 +69,28 @@ class LesionLocatorSegmenter(object):
         self.tile_step_size = tile_step_size
         self.use_gaussian = use_gaussian
         self.use_mirroring = use_mirroring
-        # Optimize for limited GPU memory
+        # Optimize for limited GPU memory. These settings mutate *global* torch state
+        # (cudnn autotuner, per-process memory fraction) for the lifetime of the
+        # process, so they are opt-in via tune_cuda_globals / cuda_memory_fraction.
         if device.type == 'cuda':
-            # Enable memory optimization for limited GPU
-            torch.backends.cudnn.benchmark = False  # Disable for memory conservation
-            torch.backends.cudnn.deterministic = True
-            
-            # Set memory fraction if available
-            try:
-                # Reserve less memory for other processes
-                torch.cuda.set_per_process_memory_fraction(0.9)
-                torch.cuda.empty_cache()
-            except:
-                pass
-            
-            # Reduce tile step size for smaller patches
-            if tile_step_size < 0.7:
-                tile_step_size = 0.7  # Larger steps = fewer patches = less memory
-            
-            # Disable some memory-intensive features for limited GPU
+            if tune_cuda_globals:
+                torch.backends.cudnn.benchmark = False
+                torch.backends.cudnn.deterministic = True
+            if cuda_memory_fraction is not None:
+                try:
+                    torch.cuda.set_per_process_memory_fraction(cuda_memory_fraction)
+                    torch.cuda.empty_cache()
+                except:
+                    pass
+
+            # Adjust local tile step size / feature flags under low GPU memory.
+            # These do NOT mutate global torch state.
             try:
                 total_mem = torch.cuda.get_device_properties(0).total_memory / 1024**3
                 if total_mem < 12:  # Less than 12GB
                     print(f"Limited GPU memory detected ({total_mem:.1f}GB), optimizing settings...")
+                    if tile_step_size < 0.7:
+                        tile_step_size = 0.7  # Larger steps = fewer patches = less memory
                     use_mirroring = False  # Disable mirroring to save memory
                     perform_everything_on_device = False  # Use CPU for results
             except:
@@ -97,7 +98,7 @@ class LesionLocatorSegmenter(object):
         else:
             print(f'perform_everything_on_device=True is only supported for cuda devices! Setting this to False')
             perform_everything_on_device = False
-        
+
         self.device = device
         self.perform_everything_on_device = perform_everything_on_device
         self.use_mirroring = use_mirroring
@@ -365,9 +366,6 @@ class LesionLocatorSegmenter(object):
             self.trainer_name_tracker = trainer_name_tracker
             self.allowed_mirroring_axes = inference_allowed_mirroring_axes
             self.label_manager = plans_manager_tracker.get_label_manager(dataset_json_tracker)
-        self.tile_step_size = 0.5
-        self.use_gaussian = True
-        self.use_mirroring = True
         self.target_spacing = self.configuration_manager.spacing
         if self.track and self.configuration_manager_tracker is not None:
             self.target_spacing = self.configuration_manager_tracker.spacing
@@ -782,7 +780,7 @@ class LesionLocatorSegmenter(object):
                             axs[1,2].set_title('Prediction') 
                             axs[1,2].axis('off')
                             if use_prev_tp:
-                                prompt_bl = prompt_bl[0].detach().cpu().numpy()
+                                prompt_bl_np = prompt_bl[0].detach().cpu().numpy()  # noqa: F841 (visualization convenience)
                                 try:
                                     # Axial view for baseline
                                     mask_ones_gt_axial_bl = np.where(prev_seg_resampled == 1)
@@ -909,16 +907,18 @@ class LesionLocatorSegmenter(object):
     
 
     def mirror_and_predict(self, x0, x1, prompt):
-        # Disable mirroring for limited GPU memory
+        # Disable mirroring locally when GPU memory is limited; do NOT mutate self.use_mirroring,
+        # which is shared with segmentation calls and must stay at the value set by the caller/CLI.
+        use_mirroring_local = self.use_mirroring
         if self.device.type == 'cuda':
             try:
                 total_mem = torch.cuda.get_device_properties(0).total_memory / 1024**3
                 if total_mem < 12:
                     print(f"Limited GPU memory ({total_mem:.1f}GB), disabling mirroring")
-                    self.use_mirroring = False
+                    use_mirroring_local = False
             except:
-                self.use_mirroring = False
-        
+                use_mirroring_local = False
+
         # Use mixed precision to save memory
         with torch.autocast(self.device.type, dtype=torch.float16, enabled=True) if self.device.type == 'cuda' else dummy_context():
             
@@ -939,7 +939,7 @@ class LesionLocatorSegmenter(object):
             del output
             
             # Simplified mirroring for memory conservation
-            if self.use_mirroring:
+            if use_mirroring_local:
                 # Only use essential mirror axes to save memory
                 essential_axes = [4]  # Only left-right mirroring
                 

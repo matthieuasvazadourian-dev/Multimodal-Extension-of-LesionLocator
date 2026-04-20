@@ -77,25 +77,31 @@ class TrackNet(nn.Module):
         return x0, x1, x0_window, x1_window
 
 
-    def get_patch_around_mask(self, prompt: torch.Tensor, is_inference: bool = False):
+    def get_patch_around_mask(self, prompt: torch.Tensor, is_inference: bool = False,
+                              patch_size: torch.Tensor = None):
         """
         Extracts a patch around a mask from a 5D tensor input.
-        This method processes a batch of 5D tensors, where each tensor represents 
-        a volumetric mask. For each mask in the batch, it identifies a region of 
-        interest (ROI) and extracts a patch centered around a foreground pixel 
+        This method processes a batch of 5D tensors, where each tensor represents
+        a volumetric mask. For each mask in the batch, it identifies a region of
+        interest (ROI) and extracts a patch centered around a foreground pixel
         or a random pixel if no foreground is present.
         Args:
-            prompt (torch.Tensor): A 5D tensor of shape (batch_size, channels, depth, height, width) 
+            prompt (torch.Tensor): A 5D tensor of shape (batch_size, channels, depth, height, width)
                 representing the input masks. The method assumes the mask is located in the first channel.
             is_inference (bool, optional): Flag indicating whether the method is being used for inference.
+            patch_size (torch.Tensor, optional): Override for the patch size. If None,
+                falls back to `self.unet_patch_size` (the registered buffer).
         Returns:
-            list: A list of slicers for each mask in the batch. Each slicer is a list of six integers 
+            list: A list of slicers for each mask in the batch. Each slicer is a list of six integers
             [xmin, xmax, ymin, ymax, zmin, zmax] defining the bounds of the patch in 3D space.
         Raises:
             AssertionError: If the input tensor `prompt` is not 5D.
         """
 
         assert prompt.dim() == 5, "Mask must be 5D"
+
+        if patch_size is None:
+            patch_size = self.unet_patch_size
 
         # Iterate over batch
         slicers = []
@@ -116,25 +122,25 @@ class TrackNet(nn.Module):
                     fg_idx = fg_indices[torch.randint(0, fg_indices.size(0), (1,))][0]
 
             # get patch around the foreground pixel
-            if fg_idx.device != self.unet_patch_size.device:
-                min = fg_idx - self.unet_patch_size.to(fg_idx.device) // 2
-                max = fg_idx + self.unet_patch_size.to(fg_idx.device) // 2
+            if fg_idx.device != patch_size.device:
+                min = fg_idx - patch_size.to(fg_idx.device) // 2
+                max = fg_idx + patch_size.to(fg_idx.device) // 2
             else:
-                min = fg_idx - self.unet_patch_size // 2
-                max = fg_idx + self.unet_patch_size // 2
+                min = fg_idx - patch_size // 2
+                max = fg_idx + patch_size // 2
 
             for i in range(3):
                 if min[i] < 0:
-                    if self.unet_patch_size.device != fg_idx.device:
-                        max[i] = self.unet_patch_size.to(fg_idx.device)[i]
+                    if patch_size.device != fg_idx.device:
+                        max[i] = patch_size.to(fg_idx.device)[i]
                     else:
-                        max[i] = self.unet_patch_size[i]
+                        max[i] = patch_size[i]
                     min[i] = 0
                 if max[i] > mask.size(i):
-                    if self.unet_patch_size.device != fg_idx.device:
-                        min[i] = mask.size(i) - self.unet_patch_size.to(fg_idx.device)[i]
+                    if patch_size.device != fg_idx.device:
+                        min[i] = mask.size(i) - patch_size.to(fg_idx.device)[i]
                     else:
-                        min[i] = mask.size(i) - self.unet_patch_size[i]
+                        min[i] = mask.size(i) - patch_size[i]
                     max[i] = mask.size(i)
                 if min[i] < 0:
                     min[i] = 0
@@ -526,11 +532,15 @@ class TrackNet(nn.Module):
         ###############################################################################
         ###############################################################################
         
-        # Patch around the warped segmentation
+        # Patch around the warped segmentation. Use a local override for lesion-focused
+        # inference; mutating `self.unet_patch_size` would replace the registered buffer
+        # with a plain tensor and hard-code [64,64,64] for subsequent calls.
         if lesion_focused:
-            self.unet_patch_size = torch.tensor([64, 64, 64], device=x1.device)
+            local_patch_size = torch.tensor([64, 64, 64], device=x1.device)
+        else:
+            local_patch_size = None
 
-        slicers = self.get_patch_around_mask(warped_prompt, is_inference)
+        slicers = self.get_patch_around_mask(warped_prompt, is_inference, patch_size=local_patch_size)
 
         patch = torch.stack([warped_prompt[b, :, slicer[0]:slicer[1], slicer[2]:slicer[3], slicer[4]:slicer[5]] for b, slicer in enumerate(slicers)])
         
@@ -557,32 +567,34 @@ class TrackNet(nn.Module):
             slc[0] = slc[0] + x1_window[0]
             slc[1] = slc[1] + x1_window[0]
             
-            # Immediately move output to CPU and clear all GPU tensors
-            if x1.device.type == 'cuda':
+            # Immediately move output to CPU and clear all GPU tensors.
+            # NOTE: x1 was moved to CPU at the top of forward(), so x1.device.type == 'cuda'
+            # is always False here. Use cuda_device (captured at entry) instead.
+            if cuda_device is not None:
                 torch.cuda.empty_cache()
-            
+
             # Move output to CPU immediately to free GPU memory
             output_cpu = output.cpu()
-            
+
             # Delete GPU tensors to free memory
             del output, bb_input, patch, warped_prompt, prompt_resampled, x0_resampled, x1_resampled
-            
-            if x1.device.type == 'cuda':
+
+            if cuda_device is not None:
                 torch.cuda.empty_cache()
-                        
+
             # Always create on CPU to avoid any GPU memory issues
             logits_out = torch.zeros((1, 2, *out_shape), dtype=torch.float32)
             logits_out[:, 0] = 1.0  # Background class
-            
+
             # Update only the patch region
             logits_out[:, :, slc[0]:slc[1], slc[2]:slc[3], slc[4]:slc[5]] = output_cpu[:, :]
-            
+
             # Only try to move to GPU if the tensor is relatively small
             tensor_size_mb = logits_out.numel() * logits_out.element_size() / (1024 * 1024)
-            
-            if x1.device.type == 'cuda' and tensor_size_mb < 100:  # Only move small tensors to GPU
+
+            if cuda_device is not None and tensor_size_mb < 100:  # Only move small tensors to GPU
                 try:
-                    logits_out = logits_out.to(x1.device)
+                    logits_out = logits_out.to(cuda_device)
                 except RuntimeError as e:
                     if "out of memory" in str(e).lower():
                         print(f"Keeping output tensor on CPU - GPU memory insufficient for {tensor_size_mb:.2f} MB tensor")

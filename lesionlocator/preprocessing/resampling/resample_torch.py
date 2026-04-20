@@ -80,7 +80,7 @@ def resample_torch_simple(
                 else:
                     for i, u in enumerate(unique_values):
                         if u == 0:
-                            pass
+                            continue
                         result[F.interpolate((data[None] == u).float(), new_shape, mode=torch_mode, antialias=False)[
                                    0] > 0.5] = u
             else:

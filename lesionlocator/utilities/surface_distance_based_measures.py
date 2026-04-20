@@ -374,8 +374,8 @@ def compute_surface_distances(mask_gt, mask_pred, spacing_mm):
                         [32,16]],
                         [[8,4],
                         [2,1]]])
-    neighbour_code_map_gt = scipy.ndimage.filters.correlate(cropmask_gt.astype(np.uint8), kernel, mode="constant", cval=0) 
-    neighbour_code_map_pred = scipy.ndimage.filters.correlate(cropmask_pred.astype(np.uint8), kernel, mode="constant", cval=0) 
+    neighbour_code_map_gt = scipy.ndimage.correlate(cropmask_gt.astype(np.uint8), kernel, mode="constant", cval=0)
+    neighbour_code_map_pred = scipy.ndimage.correlate(cropmask_pred.astype(np.uint8), kernel, mode="constant", cval=0)
 
     # create masks with the surface voxels
     borders_gt   = ((neighbour_code_map_gt != 0) & (neighbour_code_map_gt != 255))
@@ -383,12 +383,12 @@ def compute_surface_distances(mask_gt, mask_pred, spacing_mm):
 
     # compute the distance transform (closest distance of each voxel to the surface voxels)
     if borders_gt.any():
-        distmap_gt = scipy.ndimage.morphology.distance_transform_edt(~borders_gt, sampling=spacing_mm)
+        distmap_gt = scipy.ndimage.distance_transform_edt(~borders_gt, sampling=spacing_mm)
     else:
         distmap_gt = np.inf * np.ones(borders_gt.shape)
 
-    if borders_pred.any():  
-        distmap_pred = scipy.ndimage.morphology.distance_transform_edt(~borders_pred, sampling=spacing_mm)
+    if borders_pred.any():
+        distmap_pred = scipy.ndimage.distance_transform_edt(~borders_pred, sampling=spacing_mm)
     else:
         distmap_pred = np.inf * np.ones(borders_pred.shape)
 
@@ -483,6 +483,6 @@ def compute_dice_coefficient(mask_gt, mask_pred):
     """
     volume_sum = mask_gt.sum() + mask_pred.sum()
     if volume_sum == 0:
-        return np.NaN
+        return np.nan
     volume_intersect = (mask_gt & mask_pred).sum()
     return 2*volume_intersect / volume_sum

@@ -125,7 +125,9 @@ class LesionLocatorSegmenter(object):
                  adaptive_mode: bool = False,
                  embedding_output_folder: str = None,
                  lesion_focus: bool = False,
-                 crop_size: int = 64):
+                 crop_size: int = 64,
+                 tune_cuda_globals: bool = False,
+                 cuda_memory_fraction: float = None):
         self.verbose = verbose
         self.verbose_preprocessing = verbose_preprocessing
         self.allow_tqdm = allow_tqdm
@@ -145,31 +147,29 @@ class LesionLocatorSegmenter(object):
         self.tile_step_size = tile_step_size
         self.use_gaussian = use_gaussian
         self.use_mirroring = use_mirroring
-        # Optimize for limited GPU memory
+        # Optimize for limited GPU memory. Global torch-state mutations
+        # (cudnn autotuner, per-process memory fraction) are opt-in via
+        # tune_cuda_globals / cuda_memory_fraction so they don't silently
+        # persist for the entire process.
         if device.type == 'cuda':
-            # Enable memory optimization for limited GPU
-            torch.backends.cudnn.benchmark = False  # Disable for memory conservation
-            torch.backends.cudnn.deterministic = True
-            
-            # Set memory fraction if available
-            try:
-                # Reserve less memory for other processes
-                torch.cuda.set_per_process_memory_fraction(0.9)
-                torch.cuda.empty_cache()
-            except:
-                pass
-            
-            # Reduce tile step size for smaller patches
-            if tile_step_size < 0.7:
-                tile_step_size = 0.7  # Larger steps = fewer patches = less memory
-            
-            # Disable some memory-intensive features for limited GPU
+            if tune_cuda_globals:
+                torch.backends.cudnn.benchmark = False
+                torch.backends.cudnn.deterministic = True
+            if cuda_memory_fraction is not None:
+                try:
+                    torch.cuda.set_per_process_memory_fraction(cuda_memory_fraction)
+                    torch.cuda.empty_cache()
+                except:
+                    pass
+
             try:
                 total_mem = torch.cuda.get_device_properties(0).total_memory / 1024**3
                 if total_mem < 12:  # Less than 12GB
                     print(f"Limited GPU memory detected ({total_mem:.1f}GB), optimizing settings...")
-                    use_mirroring = False  # Disable mirroring to save memory
-                    perform_everything_on_device = False  # Use CPU for results
+                    if tile_step_size < 0.7:
+                        tile_step_size = 0.7
+                    use_mirroring = False
+                    perform_everything_on_device = False
             except:
                 perform_everything_on_device = False
         else:
@@ -399,7 +399,10 @@ class LesionLocatorSegmenter(object):
                 print('[petct] Patched tracker dataset_json channel_names for PET+CT early fusion.')
 
             configuration_manager_tracker = plans_manager_tracker.get_configuration(configuration_name_tracker, modality=modality)
-            parameters_tracker[0]['unet_patch_size'] = torch.tensor(configuration_manager_tracker.patch_size)
+            # Patch the unet_patch_size buffer in every fold's state_dict so k-fold ensembling
+            # doesn't silently reintroduce a stale patch size on fold 1..N.
+            for _fold_params in parameters_tracker:
+                _fold_params['unet_patch_size'] = torch.tensor(configuration_manager_tracker.patch_size)
             num_input_channels_tracker = determine_num_input_channels(
                 plans_manager_tracker, configuration_manager_tracker, dataset_json_tracker
             )
@@ -442,9 +445,6 @@ class LesionLocatorSegmenter(object):
             self.trainer_name_tracker = trainer_name_tracker
             self.allowed_mirroring_axes = inference_allowed_mirroring_axes
             self.label_manager = plans_manager_tracker.get_label_manager(dataset_json_tracker)
-        self.tile_step_size = 0.5
-        self.use_gaussian = True
-        self.use_mirroring = True
         self.target_spacing = self.configuration_manager.spacing
         if self.track and self.configuration_manager_tracker is not None:
             self.target_spacing = self.configuration_manager_tracker.spacing
@@ -1165,7 +1165,7 @@ class LesionLocatorSegmenter(object):
                             axs[1,2].set_title('Prediction') 
                             axs[1,2].axis('off')
                             if use_prev_tp:
-                                prompt_bl = prompt_bl[0].detach().cpu().numpy()
+                                prompt_bl_np = prompt_bl[0].detach().cpu().numpy()  # noqa: F841 (visualization convenience)
                                 try:
                                     # Axial view for baseline
                                     mask_ones_gt_axial_bl = np.where(prev_seg_resampled == 1)
@@ -1281,16 +1281,18 @@ class LesionLocatorSegmenter(object):
     
 
     def mirror_and_predict(self, x0, x1, prompt):
-        # Disable mirroring for limited GPU memory
+        # Disable mirroring locally when GPU memory is limited; do NOT mutate self.use_mirroring,
+        # which is shared with segmentation calls and must stay at the value set by the caller/CLI.
+        use_mirroring_local = self.use_mirroring
         if self.device.type == 'cuda':
             try:
                 total_mem = torch.cuda.get_device_properties(0).total_memory / 1024**3
                 if total_mem < 12:
                     print(f"Limited GPU memory ({total_mem:.1f}GB), disabling mirroring")
-                    self.use_mirroring = False
+                    use_mirroring_local = False
             except:
-                self.use_mirroring = False
-        
+                use_mirroring_local = False
+
         # Use mixed precision to save memory
         with torch.autocast(self.device.type, dtype=torch.float16, enabled=True) if self.device.type == 'cuda' else dummy_context():
             output = self.network_tracker(x0, x1, prompt, is_inference=True, visualize=False, lesion_focused=self.lesion_focus)
@@ -1304,7 +1306,7 @@ class LesionLocatorSegmenter(object):
             del output
             
             # Simplified mirroring for memory conservation
-            if self.use_mirroring:
+            if use_mirroring_local:
                 # Only use essential mirror axes to save memory
                 essential_axes = [4]  # Only left-right mirroring
                 

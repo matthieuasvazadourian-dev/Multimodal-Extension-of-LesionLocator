@@ -1,7 +1,6 @@
 import itertools
 import multiprocessing
 import os
-import sys
 import gc
 import traceback
 import json
@@ -654,9 +653,6 @@ class LesionLocatorSegmenter(object):
                 print('[petct] Patched tracker dataset_json channel_names to {"0": "CT", "1": "PET"}')
 
             configuration_manager_tracker = plans_manager_tracker.get_configuration(configuration_name_tracker, modality=modality)
-            # set spacing
-            configuration_manager.set_spacing([1.5, 1.5, 1.5])
-            configuration_manager_tracker.set_spacing([1.5, 1.5, 1.5])
             # restore networks
             num_input_channels_tracker = determine_num_input_channels(
                 plans_manager_tracker, configuration_manager_tracker, dataset_json_tracker
@@ -699,9 +695,6 @@ class LesionLocatorSegmenter(object):
             self.trainer_name_tracker = trainer_name_tracker
             self.allowed_mirroring_axes = inference_allowed_mirroring_axes
             self.label_manager = plans_manager_tracker.get_label_manager(dataset_json_tracker)
-        self.tile_step_size = 0.5
-        self.use_gaussian = True
-        self.use_mirroring = True
         self.target_spacing = self.configuration_manager.spacing
         if self.track and self.configuration_manager_tracker is not None:
             self.target_spacing = self.configuration_manager_tracker.spacing
@@ -1018,7 +1011,7 @@ class LesionLocatorSegmenter(object):
                             axs[1,2].set_title('Prediction') 
                             axs[1,2].axis('off')
                             if use_prev_tp:
-                                prompt_bl = prompt_bl[0].detach().cpu().numpy()
+                                prompt_bl_np = prompt_bl[0].detach().cpu().numpy()  # noqa: F841 (visualization convenience)
                                 try:
                                     # Axial view for baseline
                                     mask_ones_gt_axial_bl = np.where(prev_seg_resampled == 1)
@@ -1405,8 +1398,11 @@ class LesionLocatorSegmenter(object):
         # and must always be trainable regardless of finetune_mode so that the network
         # can learn PET features from scratch.
         if getattr(self, 'petct_mode', False) and getattr(self, 'first_conv_key', None):
+            # torch.compile wraps parameters under an `_orig_mod.` prefix, so exact-match
+            # comparisons break. Match by suffix to stay robust to compile/DDP wrapping.
+            target_suffix = self.first_conv_key.split('.', 1)[-1] if '.' in self.first_conv_key else self.first_conv_key
             for name, param in self.network.named_parameters():
-                if name == self.first_conv_key:
+                if name == self.first_conv_key or name.endswith('.' + target_suffix) or name == target_suffix:
                     param.requires_grad = True
                     print(f'[petct] Forced trainable: {name}')
 
@@ -1665,8 +1661,11 @@ class LesionLocatorSegmenter(object):
             print(f"Starting: {fold_idx + 1}/{n_folds}")
             print(f"{'='*50}")
             
-            # Reset network weights for each fold (reload from checkpoint)
-            self.network.load_state_dict(self.list_of_parameters[0])
+            # Reset network weights for each fold (reload from checkpoint).
+            # Prefer fold-specific weights when an ensemble of checkpoints has been loaded;
+            # fall back to index 0 when only a single pretrained snapshot is available.
+            init_idx = fold_idx if fold_idx < len(self.list_of_parameters) else 0
+            self.network.load_state_dict(self.list_of_parameters[init_idx])
             
             # Train this fold
             fold_results = self.train_cv_fold(
@@ -1777,27 +1776,28 @@ class LesionLocatorSegmenter(object):
         self.network.to(device)
         
         # Create DataLoaders
+        # DataLoaders. num_workers comes from --num_workers (default 0).
         train_dataloader = DataLoader(
             train_dataset,
             batch_size=batch_size,
             collate_fn=training_collate_fn,
-            num_workers=0,
+            num_workers=num_workers,
         )
-        
+
         val_dataloader = DataLoader(
             val_dataset,
             batch_size=batch_size,
             collate_fn=training_collate_fn,
-            num_workers=0,
+            num_workers=num_workers,
         )
-        
+
         test_dataloader = None
         if test_dataset is not None:
             test_dataloader = DataLoader(
                 test_dataset,
                 batch_size=batch_size,
                 collate_fn=training_collate_fn,
-                num_workers=0,
+                num_workers=num_workers,
             )
         
         # Training history for this fold
@@ -1810,8 +1810,33 @@ class LesionLocatorSegmenter(object):
         print(f"Fold {fold_idx} - Validation samples: {len(fold_data['val']['input_files'])}, Prompt samples: {len(fold_data['val']['prompt_files'])}")
         if test_dataset is not None:
             print(f"Test samples: {len(test_dataset.input_files)}")
-        
-        for epoch in range(epochs):
+
+        # Resume from previous best_model.pth if present.
+        # Why: long fold runs get killed; without this they restart at epoch 0
+        # and discard hours of compute even though best_model.pth is on disk.
+        start_epoch = 0
+        if output_folder and fold_idx is not None:
+            fold_folder = os.path.join(output_folder, f'fold_{fold_idx}')
+            checkpoint_path = os.path.join(fold_folder, 'best_model.pth')
+            if os.path.exists(checkpoint_path):
+                print(f"Found existing checkpoint: {checkpoint_path}")
+                try:
+                    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+                    self.network.load_state_dict(checkpoint['network_weights'])
+                    self.optimizer.load_state_dict(checkpoint['optimizer_state'])
+                    if 'scheduler_state' in checkpoint and self.scheduler is not None:
+                        self.scheduler.load_state_dict(checkpoint['scheduler_state'])
+                    start_epoch = checkpoint['epoch'] + 1
+                    best_val_loss = checkpoint.get('best_val_loss', float('inf'))
+                    print(f"Resuming training from epoch {start_epoch}, best val loss: {best_val_loss:.4f}")
+                except Exception as e:
+                    print(f"Error loading checkpoint: {e}")
+                    print("Starting fresh training...")
+                    start_epoch = 0
+            else:
+                print("No existing checkpoint found, starting fresh training...")
+
+        for epoch in range(start_epoch, epochs):
             # Training phase
             self.network.train()
             epoch_train_loss = 0.0
@@ -1865,9 +1890,9 @@ class LesionLocatorSegmenter(object):
                         print(f"  GPU memory reserved: {_cuda_memory_reserved_gb(device):.2f} GB")
                         
                 except Exception as e:
-                    import sys
                     print(f"Error in training batch {batch_idx}: {e}")
-                    sys.exit(1)
+                    _maybe_empty_cache(device)
+                    continue
 
             avg_train_loss = epoch_train_loss / max(num_train_batches, 1)
             fold_train_losses.append(avg_train_loss)
@@ -1903,9 +1928,9 @@ class LesionLocatorSegmenter(object):
                         _maybe_empty_cache(device)
                     
                     except Exception as e:
-                        import sys
                         print(f"Error in validation batch {batch_idx}: {e}")
-                        sys.exit(1)
+                        _maybe_empty_cache(device)
+                        continue
 
             avg_val_loss = epoch_val_loss / max(num_val_batches, 1)
             fold_val_losses.append(avg_val_loss)
@@ -1965,7 +1990,8 @@ class LesionLocatorSegmenter(object):
                             _maybe_empty_cache(device)
                         except Exception as e:
                             print(f"Error in test batch {batch_idx}: {e}")
-                            sys.exit(1)
+                            _maybe_empty_cache(device)
+                            continue
 
                 avg_test_dice = np.mean(epoch_test_dice_scores) if epoch_test_dice_scores else 0.0
                 fold_test_dice_scores.append(avg_test_dice)
@@ -1980,8 +2006,9 @@ class LesionLocatorSegmenter(object):
                 best_val_loss = avg_val_loss
                 if output_folder:
                     fold_folder = os.path.join(output_folder, f'fold_{fold_idx}')
-                    self._save_checkpoint(fold_folder, 'best_model.pth', epoch, fold_idx=fold_idx, 
-                                        ckpt_path=ckpt_path, prompt_type=prompt_type)
+                    self._save_checkpoint(fold_folder, 'best_model.pth', epoch, fold_idx=fold_idx,
+                                        ckpt_path=ckpt_path, prompt_type=prompt_type,
+                                        best_val_loss=best_val_loss)
                     print(f"New best model saved for fold {fold_idx} (val_loss: {avg_val_loss:.4f})")
             
             # Save periodic checkpoint
@@ -2222,7 +2249,8 @@ class LesionLocatorSegmenter(object):
             'best_val_loss': best_val_loss
         }
 
-    def _save_checkpoint(self, output_folder, filename, epoch, fold_idx=None, ckpt_path=None, prompt_type='point'):
+    def _save_checkpoint(self, output_folder, filename, epoch, fold_idx=None, ckpt_path=None,
+                         prompt_type='point', best_val_loss=None):
         """Save model checkpoint and optionally save inference-compatible checkpoint."""
         os.makedirs(output_folder, exist_ok=True)
         checkpoint = {
@@ -2233,7 +2261,9 @@ class LesionLocatorSegmenter(object):
         }
         if self.scheduler:
             checkpoint['scheduler_state'] = self.scheduler.state_dict()
-            
+        if best_val_loss is not None:
+            checkpoint['best_val_loss'] = best_val_loss
+
         checkpoint_path = os.path.join(output_folder, filename)
         torch.save(checkpoint, checkpoint_path)
         print(f"Checkpoint saved: {checkpoint_path}")

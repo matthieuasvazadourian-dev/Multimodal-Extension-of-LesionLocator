@@ -189,34 +189,16 @@ class TrainingPreprocessor(object):
                                       dataset_json)
         
         # NEW: Crop to patch size for training
+        fu_shape_before_patch_crop = None
         if hasattr(configuration_manager, 'patch_size') and configuration_manager.patch_size is not None:
-            # Find center point for cropping (use lesion center if available)
-            center_point = None
-            # if seg is not None:
-            #     # Find center of largest lesion for cropping
-            #     unique_labels = np.unique(seg)
-            #     lesion_labels = unique_labels[unique_labels > 0]
-                
-            #     if len(lesion_labels) > 0:
-            #         # Use the largest lesion as center
-            #         largest_lesion = None
-            #         largest_size = 0
-                    
-            #         for label in lesion_labels:
-            #             lesion_mask = (seg == label)
-            #             lesion_size = np.sum(lesion_mask)
-            #             if lesion_size > largest_size:
-            #                 largest_size = lesion_size
-            #                 largest_lesion = label
-                    
-            #         if largest_lesion is not None:
-            #             lesion_coords = np.where(seg[0] == largest_lesion)
-            #             if len(lesion_coords[0]) > 0:
-            #                 center_point = tuple(int(np.mean(coords)) for coords in lesion_coords)
-            #                 if self.verbose:
-            #                     print(f'Using lesion {largest_lesion} center as crop center: {center_point}')
-            
-            # Crop to patch size, use image center for cropping
+            # Find center point for cropping (use largest-lesion centroid if available).
+            # Without this, whole-body PET/CT patches are cropped around the geometric
+            # image center (typically abdomen) and often contain no foreground at all.
+            center_point = self._largest_lesion_center(seg)
+            if self.verbose and center_point is not None:
+                print(f'Using largest-lesion centroid as crop center: {center_point}')
+
+            fu_shape_before_patch_crop = data.shape[1:]
             data, seg, crop_info = self.crop_to_patch_size(data, seg, configuration_manager.patch_size, center_point)
             
             # Store crop information in properties
@@ -245,9 +227,22 @@ class TrainingPreprocessor(object):
                 configuration_manager, dataset_json)
 
             # Apply same patch cropping to baseline data so it shares the
-            # follow-up patch shape going into the tracker.
+            # follow-up patch shape going into the tracker. Prefer the baseline
+            # seg's own largest-lesion centroid when available; otherwise, fall
+            # back to the follow-up's centroid mapped proportionally onto the
+            # baseline voxel grid so both patches cover broadly corresponding anatomy.
             if hasattr(configuration_manager, 'patch_size') and configuration_manager.patch_size is not None:
-                center_point_bl = None
+                center_point_bl = self._largest_lesion_center(bl_seg)
+                if center_point_bl is None and center_point is not None and fu_shape_before_patch_crop is not None:
+                    bl_shape = bl_data.shape[1:]
+                    if all(s > 0 for s in fu_shape_before_patch_crop):
+                        center_point_bl = tuple(
+                            int(c * (bl_s / fu_s))
+                            for c, fu_s, bl_s in zip(center_point, fu_shape_before_patch_crop, bl_shape)
+                        )
+                if self.verbose and center_point_bl is not None:
+                    print(f'Using baseline crop center: {center_point_bl}')
+
                 bl_data, bl_seg, bl_crop_info = self.crop_to_patch_size(
                     bl_data, bl_seg, configuration_manager.patch_size, center_point_bl)
                 bl_data_properties['patch_crop_info'] = bl_crop_info
@@ -258,7 +253,35 @@ class TrainingPreprocessor(object):
         # print(f"Final data shape: {data.shape}, bl_data shape: {bl_data.shape if bl_data is not None else None}", flush=True)
         return data, seg, data_properties, bl_data, bl_data_properties
 
-    def crop_to_patch_size(self, data: np.ndarray, seg: Union[np.ndarray, None], 
+    @staticmethod
+    def _largest_lesion_center(seg: Union[np.ndarray, None]) -> Union[Tuple[int, ...], None]:
+        """
+        Return the (H, W, D) centroid of the largest positive-label connected region
+        in `seg`, or None if `seg` is None / contains no foreground. Expects shape
+        [1, H, W, D] (strips the channel dimension internally).
+        """
+        if seg is None:
+            return None
+        vol = seg[0] if seg.ndim == 4 else seg
+        unique_labels = np.unique(vol)
+        lesion_labels = unique_labels[unique_labels > 0]
+        if len(lesion_labels) == 0:
+            return None
+        largest_lesion = None
+        largest_size = 0
+        for label in lesion_labels:
+            size = int(np.sum(vol == label))
+            if size > largest_size:
+                largest_size = size
+                largest_lesion = int(label)
+        if largest_lesion is None:
+            return None
+        coords = np.where(vol == largest_lesion)
+        if len(coords[0]) == 0:
+            return None
+        return tuple(int(np.mean(c)) for c in coords)
+
+    def crop_to_patch_size(self, data: np.ndarray, seg: Union[np.ndarray, None],
                           patch_size: Tuple[int, ...], center_point: Union[Tuple[int, ...], None] = None) -> Tuple[np.ndarray, Union[np.ndarray, None], dict]:
         """
         Crop data and segmentation to a fixed patch size centered around a point.

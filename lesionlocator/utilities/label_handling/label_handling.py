@@ -272,8 +272,16 @@ def convert_labelmap_to_one_hot(segmentation: Union[np.ndarray, torch.Tensor],
     DO NOT use it with 0, 32, 123, 255, ... or whatever (fix your labels, yo)
     """
     if isinstance(segmentation, torch.Tensor):
+        if output_dtype is not None:
+            tensor_dtype = output_dtype
+        elif max(all_labels) < 255:
+            tensor_dtype = torch.uint8
+        elif hasattr(torch, 'uint16') and max(all_labels) < 65535:
+            tensor_dtype = torch.uint16
+        else:
+            tensor_dtype = torch.int32
         result = torch.zeros((len(all_labels), *segmentation.shape),
-                             dtype=output_dtype if output_dtype is not None else (torch.uint8 if max(all_labels) < 255 else torch.uint16),
+                             dtype=tensor_dtype,
                              device=segmentation.device)
         # variant 1, 2x faster than 2
         result.scatter_(0, segmentation[None].long(), 1)  # why does this have to be long!?

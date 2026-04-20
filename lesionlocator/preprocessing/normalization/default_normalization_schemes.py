@@ -95,8 +95,16 @@ class ZScoreNormalization(ImageNormalization):
             # in BraTS). We want to run the normalization only in the brain region, so we need to mask the image.
             # The default nnU-net sets use_mask_for_norm to True if cropping to the nonzero region substantially
             # reduced the image size.
-            #mask = seg >= 0
-            mask = get_pet_foreground(image, thresh=0.03)
+            if seg is not None:
+                mask = seg >= 0
+            else:
+                mask = get_pet_foreground(image, thresh=0.03)
+            # Fallback: the 0.03 threshold is tuned for SUV-scaled PET. On non-PET
+            # modalities (or scans whose values all sit below 0.03) the mask can
+            # collapse to empty, which would make mean()/std() return NaN and
+            # propagate silently. Fall back to the full volume in that case.
+            if mask.sum() < 100:
+                mask = np.ones_like(mask, dtype=bool)
             mean = image[mask].mean()
             std = image[mask].std()
             image[mask] = (image[mask] - mean) / (max(std, 1e-8))
@@ -125,7 +133,7 @@ class CTNormalization(ImageNormalization):
         #       f"0.5th percentile={lower_bound}, 99.5th percentile={upper_bound}", flush=True)
         # print(f"image min={image.min()}, max={image.max()}", flush=True)
         image = image.astype(self.target_dtype, copy=False)
-        # np.clip(image, lower_bound, upper_bound, out=image)
+        np.clip(image, lower_bound, upper_bound, out=image)
         image -= mean_intensity
         image /= max(std_intensity, 1e-8)
         return image
