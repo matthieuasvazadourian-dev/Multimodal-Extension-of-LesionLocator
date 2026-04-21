@@ -80,13 +80,13 @@ class NibabelIO(BaseReaderWriter):
             print(image_fnames)
             raise RuntimeError()
 
-        meta = {
+        dict = {
             'nibabel_stuff': {
                 'original_affine': original_affines[0],
             },
             'spacing': spacings_for_nnunet[0]
         }
-        return np.vstack(images, dtype=np.float32, casting='unsafe'), meta
+        return np.vstack(images, dtype=np.float32, casting='unsafe'), dict
 
     def read_seg(self, seg_fname: str) -> Tuple[np.ndarray, dict]:
         return self.read_images((seg_fname,))
@@ -161,14 +161,14 @@ class NibabelIOWithReorient(BaseReaderWriter):
             print(image_fnames)
             raise RuntimeError()
 
-        meta = {
+        dict = {
             'nibabel_stuff': {
                 'original_affine': original_affines[0],
                 'reoriented_affine': reoriented_affines[0],
             },
             'spacing': spacings_for_nnunet[0]
         }
-        return np.vstack(images, dtype=np.float32, casting='unsafe'), meta
+        return np.vstack(images, dtype=np.float32, casting='unsafe'), dict
 
     def read_seg(self, seg_fname: str) -> Tuple[np.ndarray, dict]:
         return self.read_images((seg_fname,))
