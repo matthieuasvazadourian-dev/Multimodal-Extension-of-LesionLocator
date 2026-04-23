@@ -12,12 +12,10 @@ python -m pip install -e . --quiet
 
 FOLD=${1:?"Usage: $0 <fold>"}
 
-# NOTE: expects PET-only dataset (Dataset903) where PET is stored as _0000.nii.gz
-
-# Paths
-TEST_DATA=/scratch/nnUNet_raw/Dataset903_USZMelanomaPET/imagesTr
-TEST_PROMPT=/scratch/nnUNet_raw/Dataset903_USZMelanomaPET/labelsTr
-CKPT=/home/masva/ckpt/TrainSeg902_PET
+# Paths 
+TEST_DATA=/scratch/nnUNet_raw/Dataset901_USZMelanoma/imagesTr
+TEST_PROMPT=/scratch/nnUNet_raw/Dataset901_USZMelanoma/labelsTr
+CKPT=/home/masva/ckpt/TrainSeg900_PetCT_EarlyFusion
 OUTPUT=/home/masva/vis_pet_seg_eval/fold_$FOLD
 
 mkdir -p "$OUTPUT"
@@ -33,5 +31,5 @@ LesionLocator_track \
   -f  $FOLD \
   -t  point \
   -npp 1 -nps 1 \
-  --modality pet \
+  --modality petct \
   2>&1 | tee "$OUTPUT/eval_seg_pet_fold_$FOLD.txt"
