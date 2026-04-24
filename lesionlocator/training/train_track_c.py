@@ -1405,19 +1405,21 @@ class LesionLocatorTrack(object):
         self.setup_training(learning_rate=lr, finetune_mode=finetune_mode)
         self.network.to(device)
         
-        # Create DataLoaders. num_workers comes from --num_workers (default 0).
+        # The IterableDataset starts its own preprocessing workers via
+        # preprocessing_iterator_fromfiles. PyTorch DataLoader workers are daemonic,
+        # so they cannot safely start that inner multiprocessing pipeline.
         train_dataloader = DataLoader(
             train_dataset,
             batch_size=batch_size,
             collate_fn=training_collate_fn,
-            num_workers=num_workers,
+            num_workers=0,
         )
 
         val_dataloader = DataLoader(
             val_dataset,
             batch_size=batch_size,
             collate_fn=training_collate_fn,
-            num_workers=num_workers,
+            num_workers=0,
         )
 
         test_dataloader = None
@@ -1426,7 +1428,7 @@ class LesionLocatorTrack(object):
                 test_dataset,
                 batch_size=batch_size,
                 collate_fn=training_collate_fn,
-                num_workers=num_workers,
+                num_workers=0,
             )
         
         # Training history for this fold
@@ -1764,15 +1766,13 @@ class LesionLocatorTrack(object):
         # Move tracking network to device
         self.network_tracker.to(device)
         
-        # Create DataLoaders with tracking collate function.
-        # Preprocessing is already parallelised via the external iterator (-npp);
-        # DataLoader workers are therefore usually 0. Honour the caller's choice
-        # so users can opt into extra loader workers when running with -npp 0.
+        # Create DataLoaders with tracking collate function. The IterableDataset
+        # starts its own preprocessing workers, so DataLoader workers must stay 0.
         train_dataloader = DataLoader(
             train_dataset,
             batch_size=batch_size,
             collate_fn=tracking_collate_fn,
-            num_workers=num_workers
+            num_workers=0
         )
 
         val_dataloader = None
@@ -1781,7 +1781,7 @@ class LesionLocatorTrack(object):
                 val_dataset,
                 batch_size=1, # can only be 1 for validation
                 collate_fn=tracking_collate_fn,
-                num_workers=num_workers
+                num_workers=0
             )
 
 
@@ -1791,7 +1791,7 @@ class LesionLocatorTrack(object):
                 test_dataset,
                 batch_size=1,
                 collate_fn=tracking_collate_fn,
-                num_workers=num_workers
+                num_workers=0
             )
         
         # Training history

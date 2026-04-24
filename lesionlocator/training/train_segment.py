@@ -1419,6 +1419,10 @@ class LesionLocatorSegmenter(object):
                             if stripped not in target_suffixes:
                                 target_suffixes.add(stripped)
                                 changed = True
+                    conv_alias = suffix.replace('.all_modules.0.', '.conv.')
+                    if conv_alias != suffix and conv_alias not in target_suffixes:
+                        target_suffixes.add(conv_alias)
+                        changed = True
             forced_count = 0
             for name, param in self.network.named_parameters():
                 if any(name == suffix or name.endswith('.' + suffix) for suffix in target_suffixes):
@@ -1817,20 +1821,21 @@ class LesionLocatorSegmenter(object):
         self.setup_training(learning_rate=lr, finetune_mode=finetune_mode)
         self.network.to(device)
         
-        # Create DataLoaders
-        # DataLoaders. num_workers comes from --num_workers (default 0).
+        # The IterableDataset starts its own preprocessing workers via
+        # preprocessing_iterator_fromfiles. PyTorch DataLoader workers are daemonic,
+        # so they cannot safely start that inner multiprocessing pipeline.
         train_dataloader = DataLoader(
             train_dataset,
             batch_size=batch_size,
             collate_fn=training_collate_fn,
-            num_workers=num_workers,
+            num_workers=0,
         )
 
         val_dataloader = DataLoader(
             val_dataset,
             batch_size=batch_size,
             collate_fn=training_collate_fn,
-            num_workers=num_workers,
+            num_workers=0,
         )
 
         test_dataloader = None
@@ -1839,7 +1844,7 @@ class LesionLocatorSegmenter(object):
                 test_dataset,
                 batch_size=batch_size,
                 collate_fn=training_collate_fn,
-                num_workers=num_workers,
+                num_workers=0,
             )
         
         # Training history for this fold
