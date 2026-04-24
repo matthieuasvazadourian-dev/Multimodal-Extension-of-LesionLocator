@@ -114,6 +114,14 @@ class TrainingPreprocessor(object):
     def all_exist(self, files):
         return all(os.path.exists(f) for f in files)
 
+    @staticmethod
+    def _read_seg_on_reference_grid(rw, seg_file: str, image_files: List[str]):
+        reference_file = image_files[0] if isinstance(image_files, (list, tuple)) else image_files
+        try:
+            return rw.read_seg(seg_file, reference_file)
+        except TypeError:
+            return rw.read_seg(seg_file)
+
     def run_case(self, image_files: List[str], seg_file: Union[str, None], plans_manager: PlansManager,
                  configuration_manager: ConfigurationManager,
                  dataset_json: Union[dict, str],
@@ -177,7 +185,7 @@ class TrainingPreprocessor(object):
         # 
         # if possible, load seg
         if seg_file is not None:
-            seg, _ = rw.read_seg(seg_file)
+            seg, _ = self._read_seg_on_reference_grid(rw, seg_file, image_files)
         else:
             seg = None
 
@@ -218,7 +226,7 @@ class TrainingPreprocessor(object):
             # Only the baseline segmentation is gated on `train` (only available
             # during training).
             if train:
-                bl_seg = rw.read_seg(bl_seg_file)[0] if bl_seg_file is not None else None
+                bl_seg = self._read_seg_on_reference_grid(rw, bl_seg_file, bl_files)[0] if bl_seg_file is not None else None
             else:
                 bl_seg = None
 

@@ -27,6 +27,7 @@ class SimpleITKIO(BaseReaderWriter):
         '.gipl'
     ]
     _reported_channel_resampling = False
+    _reported_seg_resampling = False
 
     @staticmethod
     def _same_geometry(image: sitk.Image, reference: sitk.Image) -> bool:
@@ -56,6 +57,24 @@ class SimpleITKIO(BaseReaderWriter):
         transform = sitk.Transform(reference.GetDimension(), sitk.sitkIdentity)
         image = sitk.Cast(image, sitk.sitkFloat32)
         return sitk.Resample(image, reference, transform, sitk.sitkLinear, 0.0, sitk.sitkFloat32)
+
+    @classmethod
+    def _resample_seg_to_reference_if_needed(cls, seg: sitk.Image,
+                                             reference: sitk.Image,
+                                             seg_fname: str) -> sitk.Image:
+        if cls._same_geometry(seg, reference):
+            return seg
+        if seg.GetDimension() != reference.GetDimension():
+            raise RuntimeError(
+                f'Cannot align segmentation {seg_fname}: dimension '
+                f'{seg.GetDimension()} does not match reference dimension '
+                f'{reference.GetDimension()}.'
+            )
+        if not cls._reported_seg_resampling:
+            print('[SimpleITKIO] Resampling segmentation masks to the reference image grid.')
+            cls._reported_seg_resampling = True
+        transform = sitk.Transform(reference.GetDimension(), sitk.sitkIdentity)
+        return sitk.Resample(seg, reference, transform, sitk.sitkNearestNeighbor, 0, seg.GetPixelID())
 
     def read_images(self, image_fnames: Union[List[str], Tuple[str, ...]]) -> Tuple[np.ndarray, dict]:
         images = []
@@ -146,8 +165,35 @@ class SimpleITKIO(BaseReaderWriter):
         }
         return np.vstack(images, dtype=np.float32, casting='unsafe'), dict
 
-    def read_seg(self, seg_fname: str) -> Tuple[np.ndarray, dict]:
-        return self.read_images((seg_fname, ))
+    def read_seg(self, seg_fname: str, reference_fname: Union[str, None] = None) -> Tuple[np.ndarray, dict]:
+        if reference_fname is None:
+            return self.read_images((seg_fname, ))
+
+        reference = sitk.ReadImage(reference_fname)
+        seg = sitk.ReadImage(seg_fname)
+        seg = self._resample_seg_to_reference_if_needed(seg, reference, seg_fname)
+
+        spacing = seg.GetSpacing()
+        npy_seg = sitk.GetArrayFromImage(seg)
+        if npy_seg.ndim == 2:
+            npy_seg = npy_seg[None, None]
+            max_spacing = max(spacing)
+            spacing_for_nnunet = (max_spacing * 999, *list(spacing)[::-1])
+        elif npy_seg.ndim == 3:
+            npy_seg = npy_seg[None]
+            spacing_for_nnunet = list(spacing)[::-1]
+        else:
+            raise RuntimeError(f"Unexpected number of dimensions: {npy_seg.ndim} in file {seg_fname}")
+
+        properties = {
+            'sitk_stuff': {
+                'spacing': spacing,
+                'origin': seg.GetOrigin(),
+                'direction': seg.GetDirection()
+            },
+            'spacing': list(np.abs(spacing_for_nnunet))
+        }
+        return npy_seg, properties
 
     def write_seg(self, seg: np.ndarray, output_fname: str, properties: dict) -> None:
         assert seg.ndim == 3, 'segmentation must be 3d. If you are exporting a 2d segmentation, please provide it as shape 1,x,y'
