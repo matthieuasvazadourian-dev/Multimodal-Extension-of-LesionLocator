@@ -399,6 +399,9 @@ class LesionLocatorSegmenter(object):
 
         self.plans_manager, self.configuration_manager, self.list_of_parameters, self.network, self.dataset_json, \
         self.trainer_name, self.allowed_mirroring_axes, self.label_manager = None, None, None, None, None, None, None, None
+        self.petct_mode = False
+        self.first_conv_key = None
+        self.first_conv_expected_in_ch = None
 
         # Training-specific attributes
         self.optimizer = None
@@ -511,6 +514,7 @@ class LesionLocatorSegmenter(object):
         print("Loading segmentation model.")
         self.petct_mode = (modality == 'petct')
         self.first_conv_key = None
+        self.first_conv_expected_in_ch = None
 
         if use_folds is None:
             use_folds = LesionLocatorSegmenter.auto_detect_available_folds(model_training_output_dir, checkpoint_name)
@@ -572,7 +576,9 @@ class LesionLocatorSegmenter(object):
         # from a petct-trained checkpoint) to avoid shape mismatches on load_state_dict.
         if self.petct_mode:
             self.first_conv_key = self._find_first_conv_key(parameters[0])
+            print(f'[petct] Checkpoint first conv key: {self.first_conv_key}')
             expected_in_ch = num_input_channels + 1  # +1 for prompt channel
+            self.first_conv_expected_in_ch = expected_in_ch
             current_in_ch = parameters[0][self.first_conv_key].shape[1]
             if current_in_ch < expected_in_ch:
                 parameters = [self._extend_first_conv_weights(
@@ -1398,13 +1404,46 @@ class LesionLocatorSegmenter(object):
         # and must always be trainable regardless of finetune_mode so that the network
         # can learn PET features from scratch.
         if getattr(self, 'petct_mode', False) and getattr(self, 'first_conv_key', None):
-            # torch.compile wraps parameters under an `_orig_mod.` prefix, so exact-match
-            # comparisons break. Match by suffix to stay robust to compile/DDP wrapping.
-            target_suffix = self.first_conv_key.split('.', 1)[-1] if '.' in self.first_conv_key else self.first_conv_key
+            # torch.compile/DDP may wrap parameter names, while checkpoints can contain
+            # shared-module aliases such as "all_modules.0.encoder...". A one-dot split
+            # turns that into "0.encoder...", which cannot match the live module name.
+            target_suffixes = {self.first_conv_key}
+            wrappers = ('_orig_mod.', 'module.', 'network.', 'decoder.', 'all_modules.0.')
+            changed = True
+            while changed:
+                changed = False
+                for suffix in list(target_suffixes):
+                    for prefix in wrappers:
+                        if suffix.startswith(prefix):
+                            stripped = suffix[len(prefix):]
+                            if stripped not in target_suffixes:
+                                target_suffixes.add(stripped)
+                                changed = True
+            forced_count = 0
             for name, param in self.network.named_parameters():
-                if name == self.first_conv_key or name.endswith('.' + target_suffix) or name == target_suffix:
+                if any(name == suffix or name.endswith('.' + suffix) for suffix in target_suffixes):
                     param.requires_grad = True
+                    forced_count += 1
                     print(f'[petct] Forced trainable: {name}')
+            if forced_count == 0:
+                expected_in_ch = getattr(self, 'first_conv_expected_in_ch', None)
+                first_conv_candidates = [
+                    (name, param) for name, param in self.network.named_parameters()
+                    if param.ndim == 5
+                    and (expected_in_ch is None or param.shape[1] == expected_in_ch)
+                ]
+                if not first_conv_candidates:
+                    first_conv_candidates = [
+                        (name, param) for name, param in self.network.named_parameters()
+                        if param.ndim == 5
+                    ]
+                if first_conv_candidates:
+                    min_in_ch = min(param.shape[1] for _, param in first_conv_candidates)
+                    for name, param in sorted(first_conv_candidates):
+                        if param.shape[1] == min_in_ch:
+                            param.requires_grad = True
+                            print(f'[petct] Forced trainable by shape fallback: {name}')
+                            break
 
         # Get trainable parameters for optimizer
         trainable_params = [p for p in self.network.parameters() if p.requires_grad]
@@ -1517,7 +1556,10 @@ class LesionLocatorSegmenter(object):
         # Print summary of enabled/disabled parameters
         trainable_params = sum(p.numel() for p in self.network.parameters() if p.requires_grad)
         total_params = sum(p.numel() for p in self.network.parameters())
-        print(f"Trainable parameters: {trainable_params:,} / {total_params:,} ({100*trainable_params/total_params:.1f}%)")
+        trainable_label = "Trainable parameters"
+        if finetune_mode == 'first_conv' and getattr(self, 'petct_mode', False):
+            trainable_label = "Trainable parameters before PET+CT first-conv override"
+        print(f"{trainable_label}: {trainable_params:,} / {total_params:,} ({100*trainable_params/total_params:.1f}%)")
 
     def _combined_loss(self, predictions, targets):
         """Combined CrossEntropy + Dice loss for segmentation training."""
