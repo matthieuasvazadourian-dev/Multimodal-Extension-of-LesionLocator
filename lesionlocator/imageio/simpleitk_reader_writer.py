@@ -26,6 +26,36 @@ class SimpleITKIO(BaseReaderWriter):
         '.mha',
         '.gipl'
     ]
+    _reported_channel_resampling = False
+
+    @staticmethod
+    def _same_geometry(image: sitk.Image, reference: sitk.Image) -> bool:
+        return (
+            image.GetDimension() == reference.GetDimension()
+            and image.GetSize() == reference.GetSize()
+            and np.allclose(image.GetSpacing(), reference.GetSpacing())
+            and np.allclose(image.GetOrigin(), reference.GetOrigin())
+            and np.allclose(image.GetDirection(), reference.GetDirection())
+        )
+
+    @classmethod
+    def _resample_to_reference_if_needed(cls, image: sitk.Image,
+                                         reference: sitk.Image,
+                                         image_fname: str) -> sitk.Image:
+        if cls._same_geometry(image, reference):
+            return image
+        if image.GetDimension() != reference.GetDimension():
+            raise RuntimeError(
+                f'Cannot align image channel {image_fname}: dimension '
+                f'{image.GetDimension()} does not match reference dimension '
+                f'{reference.GetDimension()}.'
+            )
+        if not cls._reported_channel_resampling:
+            print('[SimpleITKIO] Resampling non-reference image channels to the first channel grid.')
+            cls._reported_channel_resampling = True
+        transform = sitk.Transform(reference.GetDimension(), sitk.sitkIdentity)
+        image = sitk.Cast(image, sitk.sitkFloat32)
+        return sitk.Resample(image, reference, transform, sitk.sitkLinear, 0.0, sitk.sitkFloat32)
 
     def read_images(self, image_fnames: Union[List[str], Tuple[str, ...]]) -> Tuple[np.ndarray, dict]:
         images = []
@@ -34,8 +64,13 @@ class SimpleITKIO(BaseReaderWriter):
         directions = []
 
         spacings_for_nnunet = []
-        for f in image_fnames:
+        reference_image = None
+        for channel_idx, f in enumerate(image_fnames):
             itk_image = sitk.ReadImage(f)
+            if channel_idx == 0:
+                reference_image = itk_image
+            else:
+                itk_image = self._resample_to_reference_if_needed(itk_image, reference_image, f)
             spacings.append(itk_image.GetSpacing())
             origins.append(itk_image.GetOrigin())
             directions.append(itk_image.GetDirection())
