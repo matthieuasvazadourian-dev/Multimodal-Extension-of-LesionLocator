@@ -25,7 +25,7 @@ mkdir -p "$OUTPUT"
 mkdir -p "$CKPT_OUT"
 
 # Memory tuning
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:64
+export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:64
 export CUDA_LAUNCH_BLOCKING=1
 export CUDA_VISIBLE_DEVICES=0
 

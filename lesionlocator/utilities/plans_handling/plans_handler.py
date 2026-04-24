@@ -269,7 +269,11 @@ class PlansManager(object):
             configuration['use_mask_for_norm'] = [False, True]
             configuration['spacing'] = [3.30, 1.75, 1.75]
             configuration['median_image_size_in_voxels'] = [371, 512, 512]
-            configuration['patch_size'] = [256, 256, 256]
+            # PET+CT carries one extra image channel and trains through the whole
+            # frozen network to update the widened first convolution. 256^3 is too
+            # close to the 32 GB V100 limit, so keep a lesion-centered patch that
+            # remains divisible by the 5 downsampling stages.
+            configuration['patch_size'] = [192, 224, 224]
         elif modality == 'ct':
             configuration['normalization_schemes'] = ['CTNormalization']
             configuration['spacing'] = [3.30, 1.75, 1.75] # [3.30, 1.25, 1.25]

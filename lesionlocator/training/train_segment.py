@@ -100,6 +100,24 @@ def _cuda_total_memory_gb(device: torch.device):
     return torch.cuda.get_device_properties(0).total_memory / 1024**3 if _uses_cuda_device(device) else None
 
 
+def _is_fatal_cuda_error(error: Exception) -> bool:
+    if isinstance(error, torch.cuda.OutOfMemoryError):
+        return True
+    message = str(error)
+    return any(token in message for token in (
+        'CUDA out of memory',
+        'CUDACachingAllocator',
+        'INTERNAL ASSERT FAILED',
+    ))
+
+
+def _raise_if_fatal_cuda_error(error: Exception, phase: str, batch_idx: int, device: torch.device):
+    if _is_fatal_cuda_error(error):
+        print(f"Fatal CUDA memory/allocator error in {phase} batch {batch_idx}; aborting this run.")
+        _maybe_empty_cache(device)
+        raise error
+
+
 def _safe_mean(values) -> float:
     return float(np.mean(values)) if len(values) > 0 else 0.0
 
@@ -1926,18 +1944,21 @@ class LesionLocatorSegmenter(object):
                     # loss.backward()
                     # self.optimizer.step()
                                         
-                    epoch_train_loss += loss.item()
+                    loss_value = loss.item()
+                    epoch_train_loss += loss_value
                     num_train_batches += 1
-                    
+
+                    del data, prompt, target, combined_input, outputs, loss
                     _maybe_empty_cache(device)
                     #if batch_idx % 10 == 0:
-                    print(f"  Batch {batch_idx}, Loss: {loss.item():.4f}")
+                    print(f"  Batch {batch_idx}, Loss: {loss_value:.4f}")
                     if _uses_cuda_device(device):
                         print(f"  GPU memory allocated: {_cuda_memory_allocated_gb(device):.2f} GB")
                         print(f"  GPU memory reserved: {_cuda_memory_reserved_gb(device):.2f} GB")
                         
                 except Exception as e:
                     print(f"Error in training batch {batch_idx}: {e}")
+                    _raise_if_fatal_cuda_error(e, 'training', batch_idx, device)
                     _maybe_empty_cache(device)
                     continue
 
@@ -1969,13 +1990,16 @@ class LesionLocatorSegmenter(object):
                             outputs = self.network(combined_input)
                             loss = self.loss_function(outputs, target)
                         
-                        epoch_val_loss += loss.item()
+                        loss_value = loss.item()
+                        epoch_val_loss += loss_value
                         num_val_batches += 1
                         
+                        del data, prompt, target, combined_input, outputs, loss
                         _maybe_empty_cache(device)
                     
                     except Exception as e:
                         print(f"Error in validation batch {batch_idx}: {e}")
+                        _raise_if_fatal_cuda_error(e, 'validation', batch_idx, device)
                         _maybe_empty_cache(device)
                         continue
 
@@ -2034,9 +2058,11 @@ class LesionLocatorSegmenter(object):
                                             f'{filename}_fold_{fold_idx}_epoch_{epoch}_batch_{batch_idx}_sample_{i}',
                                             test_viz_folder, epoch
                                         )
+                            del data, prompt, target, combined_input, outputs
                             _maybe_empty_cache(device)
                         except Exception as e:
                             print(f"Error in test batch {batch_idx}: {e}")
+                            _raise_if_fatal_cuda_error(e, 'test', batch_idx, device)
                             _maybe_empty_cache(device)
                             continue
 
@@ -2181,6 +2207,7 @@ class LesionLocatorSegmenter(object):
                         
                 except Exception as e:
                     print(f"Error in training batch {batch_idx}: {e}")
+                    _raise_if_fatal_cuda_error(e, 'training', batch_idx, device)
                     import traceback
                     traceback.print_exc()
                     continue
@@ -2257,6 +2284,7 @@ class LesionLocatorSegmenter(object):
                             
                         except Exception as e:
                             print(f"Error in validation batch {batch_idx}: {e}")
+                            _raise_if_fatal_cuda_error(e, 'validation', batch_idx, device)
                             traceback.print_exc()
                             continue
                 
