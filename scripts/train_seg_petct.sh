@@ -12,11 +12,11 @@ python -m pip install -e . --quiet
 
 FOLD=${1:?"Usage: $0 <fold>"}
 
-# Paths 
-TRAIN_DATA=/scratch/nnUNet_raw/Dataset900_USZMelanoma/imagesTr
-TRAIN_PROMPT=/scratch/nnUNet_raw/Dataset900_USZMelanoma/labelsTr
-VAL_DATA=/scratch/nnUNet_raw/Dataset901_USZMelanoma/imagesTr
-VAL_PROMPT=/scratch/nnUNet_raw/Dataset901_USZMelanoma/labelsTr
+# Paths — PET+CT dataset lives in home (symlinks to scratch NIfTIs, zero extra disk usage)
+TRAIN_DATA=/home/masva/datasets/Dataset900_USZMelanomaPETCT/imagesTr
+TRAIN_PROMPT=/home/masva/datasets/Dataset900_USZMelanomaPETCT/labelsTr
+VAL_DATA=/home/masva/datasets/Dataset901_USZMelanomaPETCT/imagesTr
+VAL_PROMPT=/home/masva/datasets/Dataset901_USZMelanomaPETCT/labelsTr
 CKPT_IN=/scratch/LesionLocator_saved_ckpt/TrainSeg800_LesionLocatorFTDec
 CKPT_OUT=/home/masva/ckpt/TrainSeg900_PetCT_EarlyFusion
 OUTPUT=/home/masva/ckpt/TrainSeg900_PetCT_EarlyFusion/fold_$FOLD

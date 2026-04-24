@@ -23,10 +23,10 @@ export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128,expandable_segments:True
 echo "Fine-tuning TrackNet on Dataset900 (PET+CT), fold ${FOLD}..."
 
 LesionLocator_train_track \
-  -i  /scratch/nnUNet_raw/Dataset900_USZMelanoma/imagesTr \
-  -iv /scratch/nnUNet_raw/Dataset901_USZMelanoma/imagesTr \
-  -p  /scratch/nnUNet_raw/Dataset900_USZMelanoma/labelsTr \
-  -pv /scratch/nnUNet_raw/Dataset901_USZMelanoma/labelsTr \
+  -i  /home/masva/datasets/Dataset900_USZMelanomaPETCT/imagesTr \
+  -iv /home/masva/datasets/Dataset901_USZMelanomaPETCT/imagesTr \
+  -p  /home/masva/datasets/Dataset900_USZMelanomaPETCT/labelsTr \
+  -pv /home/masva/datasets/Dataset901_USZMelanomaPETCT/labelsTr \
   -o  "$OUTPUT_DIR" \
   -t  point \
   -m  "$SEG_CKPT" \
