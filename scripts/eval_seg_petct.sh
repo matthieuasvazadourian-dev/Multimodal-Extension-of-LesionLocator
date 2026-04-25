@@ -12,9 +12,9 @@ python -m pip install -e . --quiet
 
 FOLD=${1:?"Usage: $0 <fold>"}
 
-# Paths 
-TEST_DATA=/scratch/nnUNet_raw/Dataset901_USZMelanoma/imagesTr
-TEST_PROMPT=/scratch/nnUNet_raw/Dataset901_USZMelanoma/labelsTr
+# Paths — PET+CT dataset lives in home (paired _0000 CT and _0001 PET files)
+TEST_DATA=/home/masva/datasets/Dataset901_USZMelanomaPETCT/imagesTr
+TEST_PROMPT=/home/masva/datasets/Dataset901_USZMelanomaPETCT/labelsTr
 CKPT=/home/masva/ckpt/TrainSeg900_PetCT_EarlyFusion
 OUTPUT=/home/masva/vis_pet_seg_eval/fold_$FOLD
 
