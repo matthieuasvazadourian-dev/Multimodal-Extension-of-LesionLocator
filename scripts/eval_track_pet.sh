@@ -25,7 +25,7 @@ COMBINED_CKPT_ROOT="$OUTPUT/combined_ckpt_root"
 
 mkdir -p "$OUTPUT"
 
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:64
+export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:64
 export CUDA_LAUNCH_BLOCKING=1
 export CUDA_VISIBLE_DEVICES=0
 

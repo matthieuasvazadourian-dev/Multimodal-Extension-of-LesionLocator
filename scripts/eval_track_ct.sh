@@ -21,7 +21,7 @@ EMBED_OUTPUT_DIR=/scratch/outputs_matthieu/embeddings/ct/decoder_stage_2/fold_${
 
 mkdir -p "$OUTPUT_DIR"
 
-export PYTORCH_ALLOC_CONF=expandable_segments:True,max_split_size_mb:64
+export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:64
 export CUDA_LAUNCH_BLOCKING=1
 export CUDA_VISIBLE_DEVICES=0
 

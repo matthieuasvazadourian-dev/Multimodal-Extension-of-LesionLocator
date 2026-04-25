@@ -21,7 +21,7 @@ INFERENCE_CKPT_DIR=/home/masva/ckpt/inference
 mkdir -p "$OUTPUT_DIR"
 mkdir -p "$INFERENCE_CKPT_DIR"
 
-export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128,expandable_segments:True
+export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
 
 echo "Fine-tuning TrackNet on Dataset902 (PET only), fold ${FOLD}..."
 

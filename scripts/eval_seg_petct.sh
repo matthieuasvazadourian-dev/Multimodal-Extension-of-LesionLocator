@@ -20,7 +20,7 @@ OUTPUT=/home/masva/vis_pet_seg_eval/fold_$FOLD
 
 mkdir -p "$OUTPUT"
 
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:64
+export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:64
 export CUDA_VISIBLE_DEVICES=0
 
 LesionLocator_track \
