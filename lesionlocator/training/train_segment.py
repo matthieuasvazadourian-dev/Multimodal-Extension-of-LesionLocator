@@ -2375,6 +2375,16 @@ class LesionLocatorSegmenter(object):
             print(f"  - configuration: {config_name}")
             print(f"  - allowed_mirroring_axes: {getattr(self, 'allowed_mirroring_axes', None)}")
 
+            # Write metadata files from in-memory state so the inference checkpoint is
+            # self-contained and correct for the actual trained model (e.g. petct has
+            # the right channel_names on disk, no runtime patch needed).
+            # Always overwrite — never preserve stale metadata from a previous run.
+            inference_parent_dir = os.path.dirname(inference_dir)  # point_optimized/
+            save_json(self.dataset_json, join(inference_parent_dir, 'dataset.json'))
+            print(f"Written dataset.json to {inference_parent_dir}")
+            save_json(self.plans, join(inference_parent_dir, 'plans.json'))
+            print(f"Written plans.json to {inference_parent_dir}")
+
     def create_training_dataset(self, input_files, prompt_files, output_files, prompt_type,
                                num_processes=3, verbose=False, track=False):
         """
