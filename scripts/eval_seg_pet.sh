@@ -4,7 +4,7 @@ source /opt/conda/etc/profile.d/conda.sh
 conda activate lesionlocator
 export PATH="/home/runai-home/.local/bin:$PATH"
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 cd "$REPO_ROOT"
