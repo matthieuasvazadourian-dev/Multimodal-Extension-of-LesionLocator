@@ -301,10 +301,12 @@ class LesionDatasetWrapper(IterableDataset):
                 else:
                     prompt_tensor = torch.from_numpy(p_dense).float()
 
+                # Store as uint8 (binary 0/1) — 8× less RAM than int64.
+                # The loss casts to .long() internally so this is transparent.
                 if isinstance(gt_mask[0], torch.Tensor):
-                    target_tensor = gt_mask[0].long()
+                    target_tensor = gt_mask[0].byte()
                 else:
-                    target_tensor = torch.from_numpy(gt_mask[0]).long()
+                    target_tensor = torch.from_numpy(gt_mask[0]).byte()
 
                 sample = {
                     'data': data_tensor,        # [C, H, W, D]
@@ -1482,6 +1484,7 @@ class LesionLocatorSegmenter(object):
         )
         
         # Setup loss function (CrossEntropy + Dice loss)
+        self._ce_loss = nn.CrossEntropyLoss()
         self.loss_function = self._combined_loss
         
         # Setup learning rate scheduler
@@ -1583,12 +1586,8 @@ class LesionLocatorSegmenter(object):
 
     def _combined_loss(self, predictions, targets):
         """Combined CrossEntropy + Dice loss for segmentation training."""
-        # CrossEntropy loss
-        ce_loss = nn.CrossEntropyLoss()(predictions, targets.long())
-        
-        # Dice loss (use external function)
+        ce_loss = self._ce_loss(predictions, targets.long())
         dice_loss_val = dice_loss(predictions, targets)
-        
         return ce_loss + dice_loss_val
 
     def _visualize_validation_sample(self, data, target, prediction, filename, output_folder, epoch):
@@ -1901,94 +1900,86 @@ class LesionLocatorSegmenter(object):
                 print("No existing checkpoint found, starting fresh training...")
 
         for epoch in range(start_epoch, epochs):
+            epoch_start = time.time()
             # Training phase
             self.network.train()
-            epoch_train_loss = 0.0
+            epoch_train_loss = torch.zeros(1, device=device)
             num_train_batches = 0
-            
+
             print(f"\nFold {fold_idx}, Epoch {epoch+1}/{epochs}")
             print("Training...")
-            file_names = set()
 
             for batch_idx, batch in enumerate(train_dataloader):
                 try:
                     data = batch['data'].to(device)
                     prompt = batch['prompt'].to(device)
                     target = batch['target'].to(device)
-                    
+
                     if data.dim() == 4:
                         data = data.unsqueeze(0)
                         prompt = prompt.unsqueeze(0)
                         target = target.unsqueeze(0)
-                    
-                    combined_input = torch.cat([data, prompt], dim=1)  
-                    
-                    self.optimizer.zero_grad()
+
+                    combined_input = torch.cat([data, prompt], dim=1)
+
+                    self.optimizer.zero_grad(set_to_none=True)
 
                     with _autocast_context(device):
                         outputs = self.network(combined_input)
                         loss = self.loss_function(outputs, target)
 
-                    # with autocast():
-                    #     outputs = self.network(combined_input)
-                    #     loss = self.loss_function(outputs, target)
-                    
                     self.scaler.scale(loss).backward()
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
 
-                    # self.optimizer.zero_grad()
-                    # outputs = self.network(combined_input)
-                    # loss = self.loss_function(outputs, target)
-                    # loss.backward()
-                    # self.optimizer.step()
-                                        
-                    loss_value = loss.item()
-                    epoch_train_loss += loss_value
+                    epoch_train_loss += loss.detach()
                     num_train_batches += 1
 
-                    del data, prompt, target, combined_input, outputs, loss
                     if batch_idx % 10 == 0:
-                        print(f"  Batch {batch_idx}, Loss: {loss_value:.4f}")
-                        
+                        # .item() syncs GPU — only pay this cost every 10 batches
+                        print(f"  Batch {batch_idx}, Loss: {loss.detach().item():.4f}")
+
+                    del data, prompt, target, combined_input, outputs, loss
+
                 except Exception as e:
                     print(f"Error in training batch {batch_idx}: {e}")
                     _raise_if_fatal_cuda_error(e, 'training', batch_idx, device)
                     _maybe_empty_cache(device)
                     continue
 
-            avg_train_loss = epoch_train_loss / max(num_train_batches, 1)
+            avg_train_loss = (epoch_train_loss / max(num_train_batches, 1)).item()
             fold_train_losses.append(avg_train_loss)
-            print(f"Training Loss: {avg_train_loss:.4f}")
+            train_time = time.time() - epoch_start
+            print(f"Training Loss: {avg_train_loss:.4f}  ({train_time:.1f}s)")
             
             # Validation phase (for loss computation only)
+            val_start = time.time()
             self.network.eval()
-            epoch_val_loss = 0.0
+            epoch_val_loss = torch.zeros(1, device=device)
             num_val_batches = 0
-            
+
             print("Validating (loss computation on CV fold)...")
-            with torch.no_grad():
+            with torch.inference_mode():
                 for batch_idx, batch in enumerate(val_dataloader):
                     try:
                         data = batch['data'].to(device)
                         prompt = batch['prompt'].to(device)
                         target = batch['target'].to(device)
-                        
+
                         if data.dim() == 4:
                             data = data.unsqueeze(0)
                             prompt = prompt.unsqueeze(0)
                             target = target.unsqueeze(0)
-                        
+
                         combined_input = torch.cat([data, prompt], dim=1)
 
                         with _autocast_context(device):
                             outputs = self.network(combined_input)
                             loss = self.loss_function(outputs, target)
-                        
-                        loss_value = loss.item()
-                        epoch_val_loss += loss_value
+
+                        epoch_val_loss += loss.detach()
                         num_val_batches += 1
-                        
+
                         del data, prompt, target, combined_input, outputs, loss
 
                     except Exception as e:
@@ -1997,9 +1988,10 @@ class LesionLocatorSegmenter(object):
                         _maybe_empty_cache(device)
                         continue
 
-            avg_val_loss = epoch_val_loss / max(num_val_batches, 1)
+            avg_val_loss = (epoch_val_loss / max(num_val_batches, 1)).item()
             fold_val_losses.append(avg_val_loss)
-            print(f"Validation Loss: {avg_val_loss:.4f}")
+            val_time = time.time() - val_start
+            print(f"Validation Loss: {avg_val_loss:.4f}  ({val_time:.1f}s)")
             
             # Test phase (for dice computation and visualization)
             run_test_eval = (
@@ -2010,7 +2002,7 @@ class LesionLocatorSegmenter(object):
                 print(f"Testing (epoch {epoch+1}, every {eval_interval} epochs)...")
                 epoch_test_dice_scores = []
 
-                with torch.no_grad():
+                with torch.inference_mode():
                     for batch_idx, batch in enumerate(test_dataloader):
                         try:
                             data = batch['data'].to(device)
@@ -2525,6 +2517,11 @@ def train_from_prompt():
         torch.set_num_interop_threads(1)
 
         device = torch.device('cuda')
+        # Fixed 256³ patch shape throughout training — autotuner pays once, wins every batch.
+        torch.backends.cudnn.benchmark = True
+        # TF32 is default-on in PyTorch ≥1.12 but being explicit guarantees it on A100.
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
     else:
         device = torch.device('mps')
 
