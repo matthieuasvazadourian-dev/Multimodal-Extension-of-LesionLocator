@@ -223,9 +223,10 @@ class LesionDatasetWrapper(IterableDataset):
         # Train
         trainer.train(train_dataset, epochs=100, lr=1e-4)
     """
-    def __init__(self, input_files, prompt_files, output_files, prompt_type, 
+    def __init__(self, input_files, prompt_files, output_files, prompt_type,
                  plans_config, dataset_json, configuration_config, modality,
-                 num_processes=3, pin_memory=False, verbose=False, track=False):
+                 num_processes=3, pin_memory=False, verbose=False, track=False,
+                 use_cache=False):
         self.input_files = input_files
         self.prompt_files = prompt_files
         self.output_files = output_files
@@ -238,7 +239,8 @@ class LesionDatasetWrapper(IterableDataset):
         self.pin_memory = pin_memory
         self.verbose = verbose
         self.track = track
-        self._cache = None  # populated on first __iter__, reused every subsequent epoch
+        self.use_cache = use_cache
+        self._cache = None  # populated on first __iter__ when use_cache=True
         
     def __len__(self):
         """
@@ -254,11 +256,13 @@ class LesionDatasetWrapper(IterableDataset):
         caches every sample in RAM; subsequent epochs replay directly from cache,
         avoiding repeated NIfTI reads, resampling, and worker-process spawning.
         """
-        if self._cache is not None:
+        if self.use_cache and self._cache is not None:
             yield from self._cache
             return
 
-        self._cache = []
+        if self.use_cache:
+            self._cache = []
+
         data_iterator = preprocessing_iterator_fromfiles(
             self.input_files, self.prompt_files, self.output_files,
             self.prompt_type, self.plans_config, self.dataset_json,
@@ -316,10 +320,12 @@ class LesionDatasetWrapper(IterableDataset):
                     'lesion_id': mask_id,
                     'filename': preprocessed['ofile']
                 }
-                self._cache.append(sample)
+                if self.use_cache:
+                    self._cache.append(sample)
                 yield sample
 
-        print(f'Preprocessing cache built: {len(self._cache)} samples. Subsequent epochs served from RAM.')
+        if self.use_cache:
+            print(f'Preprocessing cache built: {len(self._cache)} samples. Subsequent epochs served from RAM.')
 
 
 def training_collate_fn(batch):
@@ -1678,7 +1684,8 @@ class LesionLocatorSegmenter(object):
     def train_cross_validation(self, train_input_files, train_prompt_files, train_output_files,
                               test_dataset=None, epochs=10, batch_size=2, lr=1e-4,
                               device=None, output_folder=None, n_folds=5, num_workers=4, prompt_type='box',
-                              ckpt_path=None, finetune_mode='all', train_fold=None, eval_interval=5):
+                              ckpt_path=None, finetune_mode='all', train_fold=None, eval_interval=5,
+                              use_cache=False):
         """
         Perform 5-fold cross-validation training.
         
@@ -1743,6 +1750,7 @@ class LesionLocatorSegmenter(object):
                 ckpt_path=ckpt_path,
                 finetune_mode=finetune_mode,
                 eval_interval=eval_interval,
+                use_cache=use_cache,
             )
             
             all_fold_results.append(fold_results)
@@ -1791,7 +1799,7 @@ class LesionLocatorSegmenter(object):
 
     def train_cv_fold(self, fold_data, test_dataset=None, epochs=10, batch_size=2, lr=1e-4,
                       device=None, output_folder=None, fold_idx=None, num_workers=4, prompt_type='box',
-                      ckpt_path=None, finetune_mode='all', eval_interval=5):
+                      ckpt_path=None, finetune_mode='all', eval_interval=5, use_cache=False):
         """
         Training function for a single cross-validation fold.
         
@@ -1820,9 +1828,10 @@ class LesionLocatorSegmenter(object):
             prompt_type=prompt_type,
             num_processes=num_workers,
             verbose=False,
-            track=False
+            track=False,
+            use_cache=use_cache,
         )
-        
+
         val_dataset = self.create_training_dataset(
             input_files=fold_data['val']['input_files'],
             prompt_files=fold_data['val']['prompt_files'],
@@ -1830,7 +1839,8 @@ class LesionLocatorSegmenter(object):
             prompt_type=prompt_type,
             num_processes=num_workers,
             verbose=False,
-            track=False
+            track=False,
+            use_cache=use_cache,
         )
         
         # Setup training components
@@ -1994,9 +2004,12 @@ class LesionLocatorSegmenter(object):
             print(f"Validation Loss: {avg_val_loss:.4f}  ({val_time:.1f}s)")
             
             # Test phase (for dice computation and visualization)
+            # eval_interval=0 disables test eval entirely.
+            # eval_interval=N runs on epochs 1,N+1,2N+1,… and always on the final epoch.
             run_test_eval = (
                 test_dataset is not None
-                and (epoch % eval_interval == 0 or epoch == epochs - 1)
+                and eval_interval > 0
+                and ((epoch + 1) % eval_interval == 0 or epoch == epochs - 1)
             )
             if run_test_eval:
                 print(f"Testing (epoch {epoch+1}, every {eval_interval} epochs)...")
@@ -2379,7 +2392,7 @@ class LesionLocatorSegmenter(object):
             print(f"Written plans.json to {inference_parent_dir}")
 
     def create_training_dataset(self, input_files, prompt_files, output_files, prompt_type,
-                               num_processes=3, verbose=False, track=False):
+                               num_processes=3, verbose=False, track=False, use_cache=False):
         """
         Create a training dataset using the existing multiprocessing pipeline.
         
@@ -2409,7 +2422,8 @@ class LesionLocatorSegmenter(object):
             num_processes=num_processes,
             pin_memory=self.device.type == 'cuda',
             verbose=verbose,
-            track=track
+            track=track,
+            use_cache=use_cache,
         )
 
 
@@ -2488,7 +2502,13 @@ def train_from_prompt():
     parser.add_argument('--train_fold', type=int, required=False, default=None,
                         help='Which fold configuration to use for training. Default: 0')
     parser.add_argument('--eval_every', type=int, required=False, default=5,
-                        help='Run test-set dice evaluation every N epochs (and always on the final epoch). Default: 5')
+                        help='Run test-set dice evaluation every N epochs (and always on the final epoch). '
+                             'Use 0 to disable test evaluation entirely. Default: 5')
+    parser.add_argument('--cache', action='store_true', required=False, default=False,
+                        help='Cache all preprocessed patches in RAM after the first epoch. '
+                             'Eliminates repeated NIfTI reads and worker spawning for epochs 2+. '
+                             'Requires enough free RAM to hold the full dataset (roughly '
+                             '200 MB per case for PET+CT at 256^3). Off by default.')
 
     print(
         "\n#######################################################################\nPlease cite the following paper "
@@ -2499,6 +2519,9 @@ def train_from_prompt():
 
     args = parser.parse_args()
     args.f = [i if i == 'all' else int(i) for i in args.f]
+
+    if args.eval_every < 0:
+        parser.error('--eval_every must be >= 0 (0 = disabled, N = every N epochs)')
 
     if not isdir(args.o):
         print(args.o)
@@ -2519,9 +2542,6 @@ def train_from_prompt():
         device = torch.device('cuda')
         # Fixed 256³ patch shape throughout training — autotuner pays once, wins every batch.
         torch.backends.cudnn.benchmark = True
-        # TF32 is default-on in PyTorch ≥1.12 but being explicit guarantees it on A100.
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
     else:
         device = torch.device('mps')
 
@@ -2661,6 +2681,7 @@ def train_from_prompt():
         finetune_mode=args.finetune,
         train_fold=args.train_fold,
         eval_interval=args.eval_every,
+        use_cache=args.cache,
     )
     
     print("Cross-validation training completed!")
