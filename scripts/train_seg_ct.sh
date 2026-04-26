@@ -19,7 +19,6 @@ INFERENCE_CKPT_DIR=/home/masva/ckpt/inference
 mkdir -p "$OUTPUT_DIR"
 mkdir -p "$INFERENCE_CKPT_DIR"
 
-export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
 export CUDA_VISIBLE_DEVICES=0
 
 echo "Fine-tuning segmentation model on Dataset800, fold ${FOLD}..."

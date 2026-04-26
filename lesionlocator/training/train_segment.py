@@ -1949,12 +1949,8 @@ class LesionLocatorSegmenter(object):
                     num_train_batches += 1
 
                     del data, prompt, target, combined_input, outputs, loss
-                    _maybe_empty_cache(device)
-                    #if batch_idx % 10 == 0:
-                    print(f"  Batch {batch_idx}, Loss: {loss_value:.4f}")
-                    if _uses_cuda_device(device):
-                        print(f"  GPU memory allocated: {_cuda_memory_allocated_gb(device):.2f} GB")
-                        print(f"  GPU memory reserved: {_cuda_memory_reserved_gb(device):.2f} GB")
+                    if batch_idx % 10 == 0:
+                        print(f"  Batch {batch_idx}, Loss: {loss_value:.4f}")
                         
                 except Exception as e:
                     print(f"Error in training batch {batch_idx}: {e}")
@@ -1995,8 +1991,7 @@ class LesionLocatorSegmenter(object):
                         num_val_batches += 1
                         
                         del data, prompt, target, combined_input, outputs, loss
-                        _maybe_empty_cache(device)
-                    
+
                     except Exception as e:
                         print(f"Error in validation batch {batch_idx}: {e}")
                         _raise_if_fatal_cuda_error(e, 'validation', batch_idx, device)
@@ -2059,7 +2054,6 @@ class LesionLocatorSegmenter(object):
                                             test_viz_folder, epoch
                                         )
                             del data, prompt, target, combined_input, outputs
-                            _maybe_empty_cache(device)
                         except Exception as e:
                             print(f"Error in test batch {batch_idx}: {e}")
                             _raise_if_fatal_cuda_error(e, 'test', batch_idx, device)
