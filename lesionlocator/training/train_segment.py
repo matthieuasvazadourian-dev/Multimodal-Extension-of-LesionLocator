@@ -238,6 +238,7 @@ class LesionDatasetWrapper(IterableDataset):
         self.pin_memory = pin_memory
         self.verbose = verbose
         self.track = track
+        self._cache = None  # populated on first __iter__, reused every subsequent epoch
         
     def __len__(self):
         """
@@ -249,9 +250,15 @@ class LesionDatasetWrapper(IterableDataset):
         
     def __iter__(self):
         """
-        Create the multiprocessing data iterator and yield training samples.
-        This preserves the existing preprocessing pipeline completely.
+        Yield training samples. First epoch runs the full preprocessing pipeline and
+        caches every sample in RAM; subsequent epochs replay directly from cache,
+        avoiding repeated NIfTI reads, resampling, and worker-process spawning.
         """
+        if self._cache is not None:
+            yield from self._cache
+            return
+
+        self._cache = []
         data_iterator = preprocessing_iterator_fromfiles(
             self.input_files, self.prompt_files, self.output_files,
             self.prompt_type, self.plans_config, self.dataset_json,
@@ -259,7 +266,7 @@ class LesionDatasetWrapper(IterableDataset):
             self.verbose, self.track, train=True
         )
 
-        print('Data iterator created, yielding training samples...')
+        print('Data iterator created, building preprocessing cache...')
 
         for preprocessed in data_iterator:
             data = preprocessed['data']
@@ -269,13 +276,10 @@ class LesionDatasetWrapper(IterableDataset):
 
             # Convert each lesion instance into a training sample
             for inst_id, p in enumerate(prompt):
-                # print(f'Processing instance {inst_id}', flush=True)
                 if len(p) == 0:
                     continue
 
-                # hard-coded for point prompts
                 mask_id = inst_id + 1
-                # mask_id = preprocessed['seg'][0, int(p[0]), int(p[1]), int(p[2])]
                 if seg_mask is None:
                     raise ValueError(
                         "Training requires segmentation-mask prompts. JSON prompts are not supported "
@@ -284,42 +288,36 @@ class LesionDatasetWrapper(IterableDataset):
                 gt_mask = (seg_mask == mask_id).astype(np.uint8)
                 p_dense = sparse_to_dense_prompt(p, self.prompt_type, array=data)
 
-                # if len(p) == 0:
-                #     continue
-                # mask_id += 1
-                # gt_mask = (seg_mask == mask_id).astype(np.uint8)
-
-                # # Convert sparse prompt to dense format
-                # p_dense = sparse_to_dense_prompt(p, self.prompt_type, array=data)
-                
                 if p_dense is None:
                     continue
-                
-                # Yield training sample - convert to torch tensors for consistent batching
-                # Handle both numpy arrays and already converted tensors
+
                 if isinstance(data, torch.Tensor):
                     data_tensor = data.float()
                 else:
                     data_tensor = torch.from_numpy(data).float()
-                
+
                 if isinstance(p_dense, torch.Tensor):
                     prompt_tensor = p_dense.float()
                 else:
                     prompt_tensor = torch.from_numpy(p_dense).float()
-                
+
                 if isinstance(gt_mask[0], torch.Tensor):
                     target_tensor = gt_mask[0].long()
                 else:
                     target_tensor = torch.from_numpy(gt_mask[0]).long()
-                
-                yield {
-                    'data': data_tensor,                    # Input image [C, H, W, D]
-                    'prompt': prompt_tensor,               # Dense prompt [1, H, W, D]
-                    'target': target_tensor,               # Ground truth [H, W, D]
-                    'properties': properties,               # Metadata
-                    'lesion_id': mask_id,                  # Lesion instance ID
-                    'filename': preprocessed['ofile']      # Original filename
+
+                sample = {
+                    'data': data_tensor,        # [C, H, W, D]
+                    'prompt': prompt_tensor,    # [1, H, W, D]
+                    'target': target_tensor,    # [H, W, D]
+                    'properties': properties,
+                    'lesion_id': mask_id,
+                    'filename': preprocessed['ofile']
                 }
+                self._cache.append(sample)
+                yield sample
+
+        print(f'Preprocessing cache built: {len(self._cache)} samples. Subsequent epochs served from RAM.')
 
 
 def training_collate_fn(batch):
@@ -1679,9 +1677,9 @@ class LesionLocatorSegmenter(object):
         plt.close()
 
     def train_cross_validation(self, train_input_files, train_prompt_files, train_output_files,
-                              test_dataset=None, epochs=10, batch_size=2, lr=1e-4, 
+                              test_dataset=None, epochs=10, batch_size=2, lr=1e-4,
                               device=None, output_folder=None, n_folds=5, num_workers=4, prompt_type='box',
-                              ckpt_path=None, finetune_mode='all', train_fold=None):
+                              ckpt_path=None, finetune_mode='all', train_fold=None, eval_interval=5):
         """
         Perform 5-fold cross-validation training.
         
@@ -1744,7 +1742,8 @@ class LesionLocatorSegmenter(object):
                 num_workers=num_workers,
                 prompt_type=prompt_type,
                 ckpt_path=ckpt_path,
-                finetune_mode=finetune_mode
+                finetune_mode=finetune_mode,
+                eval_interval=eval_interval,
             )
             
             all_fold_results.append(fold_results)
@@ -1791,9 +1790,9 @@ class LesionLocatorSegmenter(object):
         
         return all_fold_results
 
-    def train_cv_fold(self, fold_data, test_dataset=None, epochs=10, batch_size=2, lr=1e-4, 
+    def train_cv_fold(self, fold_data, test_dataset=None, epochs=10, batch_size=2, lr=1e-4,
                       device=None, output_folder=None, fold_idx=None, num_workers=4, prompt_type='box',
-                      ckpt_path=None, finetune_mode='all'):
+                      ckpt_path=None, finetune_mode='all', eval_interval=5):
         """
         Training function for a single cross-validation fold.
         
@@ -2003,10 +2002,14 @@ class LesionLocatorSegmenter(object):
             print(f"Validation Loss: {avg_val_loss:.4f}")
             
             # Test phase (for dice computation and visualization)
-            if test_dataset is not None:
-                print("Testing (dice computation and visualization on test data)...")
+            run_test_eval = (
+                test_dataset is not None
+                and (epoch % eval_interval == 0 or epoch == epochs - 1)
+            )
+            if run_test_eval:
+                print(f"Testing (epoch {epoch+1}, every {eval_interval} epochs)...")
                 epoch_test_dice_scores = []
-                
+
                 with torch.no_grad():
                     for batch_idx, batch in enumerate(test_dataloader):
                         try:
@@ -2014,38 +2017,35 @@ class LesionLocatorSegmenter(object):
                             prompt = batch['prompt'].to(device)
                             target = batch['target'].to(device)
                             filenames = batch['filename']
-                            
+
                             if data.dim() == 4:
                                 data = data.unsqueeze(0)
                                 prompt = prompt.unsqueeze(0)
                                 target = target.unsqueeze(0)
                                 filenames = [filenames]
-                            
+
                             combined_input = torch.cat([data, prompt], dim=1)
-    
+
                             with _autocast_context(device):
                                 outputs = self.network(combined_input)
-                            
-                            # Process each sample for dice computation and visualization
+
                             for i in range(data.shape[0]):
                                 filename = os.path.basename(filenames[i]).replace('.nii.gz', '')
-                                
+
                                 output_single = outputs[i:i+1]
                                 pred_probs = torch.softmax(output_single, dim=1)
                                 pred_classes = torch.argmax(pred_probs, dim=1).squeeze(0)
-                                
+
                                 data_single = data[i]
                                 target_single = target[i]
-                                
+
                                 pred_cropped = pred_classes.cpu().numpy()
                                 target_cropped = target_single.cpu().numpy()
-                                
-                                # Compute Dice score on test data
+
                                 dice_score = compute_dice_coefficient(target_cropped, pred_cropped)
                                 epoch_test_dice_scores.append(dice_score)
-                                
+
                                 if self.visualize:
-                                    # Visualize test samples (first few batches only)
                                     if batch_idx < 1 and output_folder:
                                         test_viz_folder = os.path.join(output_folder, f'fold_{fold_idx}', 'test_visualizations')
                                         self._visualize_validation_sample(
@@ -2063,11 +2063,18 @@ class LesionLocatorSegmenter(object):
                 avg_test_dice = np.mean(epoch_test_dice_scores) if epoch_test_dice_scores else 0.0
                 fold_test_dice_scores.append(avg_test_dice)
                 print(f"Test Dice Score: {avg_test_dice:.4f}")
-            
+
+            # Epoch-level GPU memory summary (one line per epoch, no per-batch sync)
+            if _uses_cuda_device(device):
+                print(f"  GPU mem — allocated: {_cuda_memory_allocated_gb(device):.2f} GB  "
+                      f"peak: {torch.cuda.max_memory_allocated(device) / 1e9:.2f} GB  "
+                      f"reserved: {_cuda_memory_reserved_gb(device):.2f} GB")
+                torch.cuda.reset_peak_memory_stats(device)
+
             # Update learning rate scheduler
             if self.scheduler:
                 self.scheduler.step(avg_val_loss)
-            
+
             # Save best model for this fold (based on validation loss)
             if avg_val_loss < best_val_loss:
                 best_val_loss = avg_val_loss
@@ -2077,7 +2084,7 @@ class LesionLocatorSegmenter(object):
                                         ckpt_path=ckpt_path, prompt_type=prompt_type,
                                         best_val_loss=best_val_loss)
                     print(f"New best model saved for fold {fold_idx} (val_loss: {avg_val_loss:.4f})")
-            
+
             # Save periodic checkpoint
             if output_folder and (epoch + 1) % 10 == 0:
                 fold_folder = os.path.join(output_folder, f'fold_{fold_idx}')
@@ -2488,6 +2495,8 @@ def train_from_prompt():
                         help='Which part of the model to finetune. Options: encoder, decoder, all, first_conv. Default: all')
     parser.add_argument('--train_fold', type=int, required=False, default=None,
                         help='Which fold configuration to use for training. Default: 0')
+    parser.add_argument('--eval_every', type=int, required=False, default=5,
+                        help='Run test-set dice evaluation every N epochs (and always on the final epoch). Default: 5')
 
     print(
         "\n#######################################################################\nPlease cite the following paper "
@@ -2654,6 +2663,7 @@ def train_from_prompt():
         ckpt_path=args.ckpt_path,
         finetune_mode=args.finetune,
         train_fold=args.train_fold,
+        eval_interval=args.eval_every,
     )
     
     print("Cross-validation training completed!")

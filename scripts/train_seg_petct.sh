@@ -25,6 +25,7 @@ OUTPUT=/home/masva/ckpt/TrainSeg900_PetCT_EarlyFusion/fold_$FOLD
 mkdir -p "$OUTPUT"
 mkdir -p "$CKPT_OUT"
 
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export CUDA_VISIBLE_DEVICES=0
 
 LesionLocator_train_segment \
