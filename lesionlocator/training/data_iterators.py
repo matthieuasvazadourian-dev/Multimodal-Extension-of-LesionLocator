@@ -108,11 +108,11 @@ def preprocessing_iterator_fromfiles(input_files: List[str],
     processes = []
     done_events = []
     target_queues = []
-    abort_event = Event()
+    abort_event = context.Event()
     print(f'[iterator] spawning {num_processes} preprocessing workers for {len(input_files)} cases', flush=True)
     for i in range(num_processes):
-        event = Event()
-        queue = Queue(maxsize=2)
+        event = context.Event()
+        queue = context.Queue(maxsize=2)
         n_assigned = len(input_files[i::num_processes])
         pr = context.Process(target=preprocess_fromfiles_save_to_queue,
                      args=(
