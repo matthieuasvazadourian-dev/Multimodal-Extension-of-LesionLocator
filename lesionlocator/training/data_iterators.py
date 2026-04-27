@@ -1,5 +1,8 @@
 import multiprocessing
+import os
 import queue
+import time
+import traceback
 from torch.multiprocessing import Event, Queue, Manager
 
 from time import sleep
@@ -27,16 +30,18 @@ def preprocess_fromfiles_save_to_queue(input_files: List[str],
                                        verbose: bool = False,
                                        track: bool = False,
                                        train: bool = False):
-    # print("Starting preprocessing worker",flush=True)
+    worker_pid = os.getpid()
+    print(f'[worker pid={worker_pid}] started, {len(input_files)} cases assigned', flush=True)
     plans_manager = PlansManager(plans_config)
     configuration_manager = plans_manager.get_configuration(configuration_config, modality=modality)
     configuration_manager.set_preprocessor_name('TrainingPreprocessor')
 
-    # print(configuration_config, modality, flush=True)
-
     try:
         preprocessor = configuration_manager.preprocessor_class(verbose=verbose)
         for idx in range(len(input_files)):
+            case_start = time.time()
+            case_label = input_files[idx][0] if isinstance(input_files[idx], list) else input_files[idx]
+            print(f'[worker pid={worker_pid}] case {idx+1}/{len(input_files)} start: {os.path.basename(str(case_label))}', flush=True)
             # input_files[idx] is either a str (single-channel) or List[str] (multi-channel).
             # The preprocessor's run_case always expects List[str].
             _image_files = input_files[idx] if isinstance(input_files[idx], list) else [input_files[idx]]
@@ -53,9 +58,7 @@ def preprocess_fromfiles_save_to_queue(input_files: List[str],
 
 
                 prompt = get_prompt_from_json(prompt_files[idx], prompt_type, data_properties, data.shape[1:])
-                # print(f'finished preprocessing for {input_files[idx]}', flush=True)
             else:
-                # print(f'Using segmentation prompts for case {input_files[idx]}', flush=True)
                 data, seg, data_properties, bl_data, bl_data_properties = preprocessor.run_case(_image_files,
                                                                     prompt_files[idx],
                                                                     plans_manager,
@@ -63,7 +66,8 @@ def preprocess_fromfiles_save_to_queue(input_files: List[str],
                                                                     dataset_json,
                                                                     track, train=train)
                 prompt = get_prompt_from_inst_or_bin_seg(seg, prompt_type)
-                # print(f'finished preprocessing for {input_files[idx]}', flush=True)
+            case_elapsed = time.time() - case_start
+            print(f'[worker pid={worker_pid}] case {idx+1}/{len(input_files)} done in {case_elapsed:.1f}s', flush=True)
             data = torch.from_numpy(data).to(dtype=torch.float32, memory_format=torch.contiguous_format)
             item = {'data': data, 'prompt': prompt, 'seg':seg, 'data_properties': data_properties, 'ofile': output_files[idx], 'bl_data': bl_data, 'bl_data_properties': bl_data_properties}
             success = False
@@ -76,8 +80,9 @@ def preprocess_fromfiles_save_to_queue(input_files: List[str],
                 except queue.Full:
                     pass
         done_event.set()
+        print(f'[worker pid={worker_pid}] all {len(input_files)} cases done', flush=True)
     except Exception as e:
-        # print(Exception, e)
+        print(f'[worker pid={worker_pid}] CRASHED: {e}\n{traceback.format_exc()}', flush=True)
         abort_event.set()
         raise e
 
@@ -105,10 +110,11 @@ def preprocessing_iterator_fromfiles(input_files: List[str],
     done_events = []
     target_queues = []
     abort_event = manager.Event()
+    print(f'[iterator] spawning {num_processes} preprocessing workers for {len(input_files)} cases', flush=True)
     for i in range(num_processes):
         event = manager.Event()
         queue = manager.Queue(maxsize=1)
-        # print(f'Starting background worker {i}, processing {len(input_files[i::num_processes])} of {len(input_files)} cases')
+        n_assigned = len(input_files[i::num_processes])
         pr = context.Process(target=preprocess_fromfiles_save_to_queue,
                      args=(
                          input_files[i::num_processes],
@@ -127,16 +133,21 @@ def preprocessing_iterator_fromfiles(input_files: List[str],
                          train
                      ), daemon=True)
         pr.start()
+        print(f'[iterator] worker {i} started (pid={pr.pid}), {n_assigned} cases', flush=True)
         target_queues.append(queue)
         done_events.append(event)
         processes.append(pr)
-    
+
+    items_yielded = 0
+    last_heartbeat = time.time()
     while True:
         found = False
         for i in range(num_processes):
             if not target_queues[i].empty():
                 item = target_queues[i].get()
                 found = True
+                items_yielded += 1
+                last_heartbeat = time.time()
                 if pin_memory:
                     [v.pin_memory() for v in item.values() if isinstance(v, torch.Tensor)]
                 yield item
@@ -149,7 +160,16 @@ def preprocessing_iterator_fromfiles(input_files: List[str],
                                 'workers or get more RAM in that case!')
             if all_done:
                 break
+            # Heartbeat: log if no item yielded in 60s so hangs are visible in training logs
+            if time.time() - last_heartbeat > 60:
+                statuses = ', '.join(
+                    f'w{i}:{"alive" if processes[i].is_alive() else "dead"}'
+                    for i in range(num_processes)
+                )
+                print(f'[iterator] waiting for workers ({statuses}), {items_yielded} cases yielded so far', flush=True)
+                last_heartbeat = time.time()
             sleep(0.01)
+    print(f'[iterator] done, {items_yielded} cases yielded total', flush=True)
     [ p.join() for p in processes ]
 
     # worker_ctr = 0

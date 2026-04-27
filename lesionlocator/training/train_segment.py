@@ -282,7 +282,10 @@ class LesionDatasetWrapper(IterableDataset):
             self.verbose, self.track, train=True
         )
 
-        print('Data iterator created, building preprocessing cache...')
+        if self.use_cache:
+            print(f'Data iterator created. Building in-memory cache from {len(self.input_files)} cases...', flush=True)
+        else:
+            print(f'Data iterator created. Streaming {len(self.input_files)} cases through {self.num_processes} preprocessing workers...', flush=True)
 
         for preprocessed in data_iterator:
             data = preprocessed['data']
