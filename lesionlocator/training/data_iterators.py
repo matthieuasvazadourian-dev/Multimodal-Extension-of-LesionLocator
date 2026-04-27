@@ -3,7 +3,13 @@ import os
 import queue
 import time
 import traceback
+import torch.multiprocessing as torch_mp
 from torch.multiprocessing import Event, Queue
+
+try:
+    torch_mp.set_sharing_strategy('file_system')
+except RuntimeError:
+    pass
 
 from time import sleep
 from typing import List
