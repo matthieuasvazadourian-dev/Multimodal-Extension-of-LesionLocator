@@ -48,5 +48,4 @@ LesionLocator_train_segment \
   -npp 2 \
   -nps 2 \
   -device cuda \
-  --cache \
   2>&1 | tee "$OUTPUT/train_seg_pet_fold_$FOLD.txt"
