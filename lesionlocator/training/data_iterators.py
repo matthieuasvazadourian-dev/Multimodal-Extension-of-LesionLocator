@@ -143,56 +143,56 @@ def preprocessing_iterator_fromfiles(input_files: List[str],
         done_events.append(event)
         processes.append(pr)
 
+    items_per_worker = [len(input_files[i::num_processes]) for i in range(num_processes)]
+    items_received = [0] * num_processes
+    total_expected = sum(items_per_worker)
     items_yielded = 0
     last_heartbeat = time.time()
-    while True:
-        found = False
-        for i in range(num_processes):
-            if not target_queues[i].empty():
-                item = target_queues[i].get()
-                found = True
-                items_yielded += 1
-                last_heartbeat = time.time()
-                if pin_memory:
-                    item = {k: (v.pin_memory() if isinstance(v, torch.Tensor) else v) for k, v in item.items()}
-                yield item
-        if not found:
-            all_done = all([done_events[i].is_set() and target_queues[i].empty() for i in range(num_processes)])
-            all_ok = all([p.is_alive() or done_events[i].is_set() for i, p in enumerate(processes)]) and not abort_event.is_set()
-            if not all_ok:
-                raise RuntimeError('Background workers died. Look for the error message further up! If there is '
-                                'none then your RAM was full and the worker was killed by the OS. Use fewer '
-                                'workers or get more RAM in that case!')
-            if all_done:
-                break
-            # Heartbeat: log if no item yielded in 60s so hangs are visible in training logs
-            if time.time() - last_heartbeat > 60:
-                statuses = ', '.join(
-                    f'w{i}:{"alive" if processes[i].is_alive() else "dead"}'
-                    for i in range(num_processes)
-                )
-                print(f'[iterator] waiting for workers ({statuses}), {items_yielded} cases yielded so far', flush=True)
-                last_heartbeat = time.time()
-            sleep(0.01)
-    print(f'[iterator] done, {items_yielded} cases yielded total', flush=True)
-    [ p.join() for p in processes ]
 
-    # worker_ctr = 0
-    # while (not done_events[worker_ctr].is_set()) or (not target_queues[worker_ctr].empty()):
-    #     # import IPython;IPython.embed()
-    #     if not target_queues[worker_ctr].empty():
-    #         item = target_queues[worker_ctr].get()
-    #         worker_ctr = (worker_ctr + 1) % num_processes
-    #     else:
-    #         all_ok = all(
-    #             [i.is_alive() or j.is_set() for i, j in zip(processes, done_events)]) and not abort_event.is_set()
-    #         if not all_ok:
-    #             raise RuntimeError('Background workers died. Look for the error message further up! If there is '
-    #                                'none then your RAM was full and the worker was killed by the OS. Use fewer '
-    #                                'workers or get more RAM in that case!')
-    #         sleep(0.01)
-    #         continue
-    #     if pin_memory:
-    #         [i.pin_memory() for i in item.values() if isinstance(i, torch.Tensor)]
-    #     yield item
-    # [p.join() for p in processes]
+    try:
+        while items_yielded < total_expected:
+            found = False
+            for i in range(num_processes):
+                if items_received[i] < items_per_worker[i]:
+                    try:
+                        item = target_queues[i].get(timeout=0.01)
+                    except queue.Empty:
+                        continue
+                    items_received[i] += 1
+                    found = True
+                    items_yielded += 1
+                    last_heartbeat = time.time()
+                    if pin_memory:
+                        item = {k: (v.pin_memory() if isinstance(v, torch.Tensor) else v) for k, v in item.items()}
+                    yield item
+            if not found:
+                all_ok = all(
+                    items_received[i] >= items_per_worker[i] or p.is_alive()
+                    for i, p in enumerate(processes)
+                ) and not abort_event.is_set()
+                if not all_ok:
+                    raise RuntimeError('Background workers died. Look for the error message further up! If there is '
+                                       'none then your RAM was full and the worker was killed by the OS. Use fewer '
+                                       'workers or get more RAM in that case!')
+                if time.time() - last_heartbeat > 60:
+                    statuses = ', '.join(
+                        f'w{i}:{"alive" if processes[i].is_alive() else "dead"}'
+                        for i in range(num_processes)
+                    )
+                    print(f'[iterator] waiting for workers ({statuses}), {items_yielded}/{total_expected} cases yielded so far', flush=True)
+                    last_heartbeat = time.time()
+                sleep(0.01)
+        print(f'[iterator] done, {items_yielded} cases yielded total', flush=True)
+    finally:
+        abort_event.set()
+        for p in processes:
+            if p.is_alive():
+                p.terminate()
+        for p in processes:
+            p.join(timeout=5)
+        for q in target_queues:
+            try:
+                q.cancel_join_thread()
+                q.close()
+            except Exception:
+                pass

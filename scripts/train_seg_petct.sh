@@ -45,7 +45,7 @@ LesionLocator_train_segment \
   --finetune first_conv \
   --train_fold $FOLD \
   --ckpt_path $CKPT_OUT \
-  -npp 2 \
+  -npp 12 \
   -nps 2 \
   -device cuda \
   2>&1 | tee "$OUTPUT/train_seg_pet_fold_$FOLD.txt"
