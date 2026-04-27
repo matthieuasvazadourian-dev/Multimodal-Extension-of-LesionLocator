@@ -27,6 +27,7 @@ mkdir -p "$CKPT_OUT"
 
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export CUDA_VISIBLE_DEVICES=0
+export LesionLocator_compile=1
 
 LesionLocator_train_segment \
   -i  $TRAIN_DATA \
