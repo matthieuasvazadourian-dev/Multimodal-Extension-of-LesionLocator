@@ -118,7 +118,7 @@ def preprocessing_iterator_fromfiles(input_files: List[str],
     print(f'[iterator] spawning {num_processes} preprocessing workers for {len(input_files)} cases', flush=True)
     for i in range(num_processes):
         event = context.Event()
-        queue = context.Queue(maxsize=2)
+        q = context.Queue(maxsize=2)
         n_assigned = len(input_files[i::num_processes])
         pr = context.Process(target=preprocess_fromfiles_save_to_queue,
                      args=(
@@ -130,7 +130,7 @@ def preprocessing_iterator_fromfiles(input_files: List[str],
                          dataset_json,
                          configuration_config,
                          modality,
-                         queue,
+                         q,
                          event,
                          abort_event,
                          verbose,
@@ -139,7 +139,7 @@ def preprocessing_iterator_fromfiles(input_files: List[str],
                      ), daemon=True)
         pr.start()
         print(f'[iterator] worker {i} started (pid={pr.pid}), {n_assigned} cases', flush=True)
-        target_queues.append(queue)
+        target_queues.append(q)
         done_events.append(event)
         processes.append(pr)
 
