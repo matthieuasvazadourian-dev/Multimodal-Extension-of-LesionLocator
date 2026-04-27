@@ -5,6 +5,7 @@ import gc
 import traceback
 import json
 import time
+import psutil
 import numpy as np
 from queue import Queue
 from threading import Thread
@@ -98,6 +99,17 @@ def _cuda_max_memory_allocated_gb(device: torch.device) -> float:
 
 def _cuda_total_memory_gb(device: torch.device):
     return torch.cuda.get_device_properties(0).total_memory / 1024**3 if _uses_cuda_device(device) else None
+
+
+def _process_tree_rss_gb() -> float:
+    proc = psutil.Process()
+    total = proc.memory_info().rss
+    for child in proc.children(recursive=True):
+        try:
+            total += child.memory_info().rss
+        except psutil.NoSuchProcess:
+            pass
+    return total / (1024 ** 3)
 
 
 def _is_fatal_cuda_error(error: Exception) -> bool:
@@ -1911,6 +1923,7 @@ class LesionLocatorSegmenter(object):
 
         for epoch in range(start_epoch, epochs):
             epoch_start = time.time()
+            _epoch_rss_peak_gb = _process_tree_rss_gb()
             # Training phase
             self.network.train()
             epoch_train_loss = torch.zeros(1, device=device)
@@ -1960,6 +1973,7 @@ class LesionLocatorSegmenter(object):
             avg_train_loss = (epoch_train_loss / max(num_train_batches, 1)).item()
             fold_train_losses.append(avg_train_loss)
             train_time = time.time() - epoch_start
+            _epoch_rss_peak_gb = max(_epoch_rss_peak_gb, _process_tree_rss_gb())
             print(f"Training Loss: {avg_train_loss:.4f}  ({train_time:.1f}s)")
             
             # Validation phase (for loss computation only)
@@ -2001,6 +2015,7 @@ class LesionLocatorSegmenter(object):
             avg_val_loss = (epoch_val_loss / max(num_val_batches, 1)).item()
             fold_val_losses.append(avg_val_loss)
             val_time = time.time() - val_start
+            _epoch_rss_peak_gb = max(_epoch_rss_peak_gb, _process_tree_rss_gb())
             print(f"Validation Loss: {avg_val_loss:.4f}  ({val_time:.1f}s)")
             
             # Test phase (for dice computation and visualization)
@@ -2067,9 +2082,11 @@ class LesionLocatorSegmenter(object):
 
                 avg_test_dice = np.mean(epoch_test_dice_scores) if epoch_test_dice_scores else 0.0
                 fold_test_dice_scores.append(avg_test_dice)
+                _epoch_rss_peak_gb = max(_epoch_rss_peak_gb, _process_tree_rss_gb())
                 print(f"Test Dice Score: {avg_test_dice:.4f}")
 
-            # Epoch-level GPU memory summary (one line per epoch, no per-batch sync)
+            # Epoch-level memory summary (one line per epoch, no per-batch sync)
+            print(f"  RAM peak (host+workers): {_epoch_rss_peak_gb:.2f} GB")
             if _uses_cuda_device(device):
                 print(f"  GPU mem — allocated: {_cuda_memory_allocated_gb(device):.2f} GB  "
                       f"peak: {torch.cuda.max_memory_allocated(device) / 1e9:.2f} GB  "

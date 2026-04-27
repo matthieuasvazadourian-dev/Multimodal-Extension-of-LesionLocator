@@ -43,7 +43,8 @@ dependencies = [
     "batchgeneratorsv2>=0.2",
     "einops",
     "natsort",
-    "blosc2>=3.0.0b1"
+    "blosc2>=3.0.0b1",
+    "psutil"
 ]
 
 [project.urls]
