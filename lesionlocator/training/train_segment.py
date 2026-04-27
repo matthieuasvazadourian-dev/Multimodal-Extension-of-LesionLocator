@@ -1748,7 +1748,10 @@ class LesionLocatorSegmenter(object):
             # Prefer fold-specific weights when an ensemble of checkpoints has been loaded;
             # fall back to index 0 when only a single pretrained snapshot is available.
             init_idx = fold_idx if fold_idx < len(self.list_of_parameters) else 0
-            self.network.load_state_dict(self.list_of_parameters[init_idx])
+            if isinstance(self.network, OptimizedModule):
+                self.network._orig_mod.load_state_dict(self.list_of_parameters[init_idx])
+            else:
+                self.network.load_state_dict(self.list_of_parameters[init_idx])
             
             # Train this fold
             fold_results = self.train_cv_fold(
@@ -1910,7 +1913,10 @@ class LesionLocatorSegmenter(object):
                 print(f"Found existing checkpoint: {checkpoint_path}")
                 try:
                     checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
-                    self.network.load_state_dict(checkpoint['network_weights'])
+                    if isinstance(self.network, OptimizedModule):
+                        self.network._orig_mod.load_state_dict(checkpoint['network_weights'])
+                    else:
+                        self.network.load_state_dict(checkpoint['network_weights'])
                     self.optimizer.load_state_dict(checkpoint['optimizer_state'])
                     if 'scheduler_state' in checkpoint and self.scheduler is not None:
                         self.scheduler.load_state_dict(checkpoint['scheduler_state'])
@@ -2354,9 +2360,10 @@ class LesionLocatorSegmenter(object):
                          prompt_type='point', best_val_loss=None):
         """Save model checkpoint and optionally save inference-compatible checkpoint."""
         os.makedirs(output_folder, exist_ok=True)
+        net_for_state = self.network._orig_mod if isinstance(self.network, OptimizedModule) else self.network
         checkpoint = {
             'epoch': epoch,
-            'network_weights': self.network.state_dict(),
+            'network_weights': net_for_state.state_dict(),
             'optimizer_state': self.optimizer.state_dict(),
             'trainer_name': self.trainer_name,
         }
@@ -2386,7 +2393,7 @@ class LesionLocatorSegmenter(object):
             
             # Create inference-compatible checkpoint with the same structure as the loaded checkpoints
             inference_checkpoint = {
-                'network_weights': self.network.state_dict(),
+                'network_weights': net_for_state.state_dict(),
                 'trainer_name': self.trainer_name,
                 'init_args': {
                     'configuration': config_name,
