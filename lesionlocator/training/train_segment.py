@@ -1937,9 +1937,9 @@ class LesionLocatorSegmenter(object):
 
             for batch_idx, batch in enumerate(train_dataloader):
                 try:
-                    data = batch['data'].to(device)
-                    prompt = batch['prompt'].to(device)
-                    target = batch['target'].to(device)
+                    data = batch['data'].to(device, non_blocking=True)
+                    prompt = batch['prompt'].to(device, non_blocking=True)
+                    target = batch['target'].to(device, non_blocking=True)
 
                     if data.dim() == 4:
                         data = data.unsqueeze(0)
@@ -1989,9 +1989,9 @@ class LesionLocatorSegmenter(object):
             with torch.inference_mode():
                 for batch_idx, batch in enumerate(val_dataloader):
                     try:
-                        data = batch['data'].to(device)
-                        prompt = batch['prompt'].to(device)
-                        target = batch['target'].to(device)
+                        data = batch['data'].to(device, non_blocking=True)
+                        prompt = batch['prompt'].to(device, non_blocking=True)
+                        target = batch['target'].to(device, non_blocking=True)
 
                         if data.dim() == 4:
                             data = data.unsqueeze(0)
@@ -2036,9 +2036,9 @@ class LesionLocatorSegmenter(object):
                 with torch.inference_mode():
                     for batch_idx, batch in enumerate(test_dataloader):
                         try:
-                            data = batch['data'].to(device)
-                            prompt = batch['prompt'].to(device)
-                            target = batch['target'].to(device)
+                            data = batch['data'].to(device, non_blocking=True)
+                            prompt = batch['prompt'].to(device, non_blocking=True)
+                            target = batch['target'].to(device, non_blocking=True)
                             filenames = batch['filename']
 
                             if data.dim() == 4:
@@ -2197,9 +2197,9 @@ class LesionLocatorSegmenter(object):
                     
                 try:
                     # Extract data from batch
-                    data = batch['data'].to(device)      # [B, C, H, W, D] or [C, H, W, D]
-                    prompt = batch['prompt'].to(device)  # [B, 1, H, W, D] or [1, H, W, D]
-                    target = batch['target'].to(device)  # [B, H, W, D] or [H, W, D]
+                    data = batch['data'].to(device, non_blocking=True)      # [B, C, H, W, D] or [C, H, W, D]
+                    prompt = batch['prompt'].to(device, non_blocking=True)  # [B, 1, H, W, D] or [1, H, W, D]
+                    target = batch['target'].to(device, non_blocking=True)  # [B, H, W, D] or [H, W, D]
                     print('Data shape ', data.shape)
                     print('Prompt shape ', prompt.shape)
                     print('Target shape ', target.shape)
@@ -2254,9 +2254,9 @@ class LesionLocatorSegmenter(object):
                     for batch_idx, batch in enumerate(val_dataloader):
                         try:
                             # Extract data from batch
-                            data = batch['data'].to(device)      # [B, C, H, W, D] or [C, H, W, D]
-                            prompt = batch['prompt'].to(device)  # [B, 1, H, W, D] or [1, H, W, D]
-                            target = batch['target'].to(device)  # [B, H, W, D] or [H, W, D]
+                            data = batch['data'].to(device, non_blocking=True)      # [B, C, H, W, D] or [C, H, W, D]
+                            prompt = batch['prompt'].to(device, non_blocking=True)  # [B, 1, H, W, D] or [1, H, W, D]
+                            target = batch['target'].to(device, non_blocking=True)  # [B, H, W, D] or [H, W, D]
                             properties = batch['properties']     # Metadata
                             filenames = batch['filename']        # Filenames for visualization
                             

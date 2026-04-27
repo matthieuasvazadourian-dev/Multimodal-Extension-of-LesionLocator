@@ -3,7 +3,7 @@ import os
 import queue
 import time
 import traceback
-from torch.multiprocessing import Event, Queue, Manager
+from torch.multiprocessing import Event, Queue
 
 from time import sleep
 from typing import List
@@ -103,17 +103,16 @@ def preprocessing_iterator_fromfiles(input_files: List[str],
                                      track: bool = False,
                                      train: bool = False):
     context = multiprocessing.get_context('spawn')
-    manager = Manager()
     num_processes = min(len(input_files), num_processes)
     assert num_processes >= 1
     processes = []
     done_events = []
     target_queues = []
-    abort_event = manager.Event()
+    abort_event = Event()
     print(f'[iterator] spawning {num_processes} preprocessing workers for {len(input_files)} cases', flush=True)
     for i in range(num_processes):
-        event = manager.Event()
-        queue = manager.Queue(maxsize=1)
+        event = Event()
+        queue = Queue(maxsize=2)
         n_assigned = len(input_files[i::num_processes])
         pr = context.Process(target=preprocess_fromfiles_save_to_queue,
                      args=(
@@ -149,7 +148,7 @@ def preprocessing_iterator_fromfiles(input_files: List[str],
                 items_yielded += 1
                 last_heartbeat = time.time()
                 if pin_memory:
-                    [v.pin_memory() for v in item.values() if isinstance(v, torch.Tensor)]
+                    item = {k: (v.pin_memory() if isinstance(v, torch.Tensor) else v) for k, v in item.items()}
                 yield item
         if not found:
             all_done = all([done_events[i].is_set() and target_queues[i].empty() for i in range(num_processes)])
