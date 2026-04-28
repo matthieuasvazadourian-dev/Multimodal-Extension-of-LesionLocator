@@ -643,6 +643,13 @@ class LesionLocatorSegmenter(object):
         self.label_manager = plans_manager.get_label_manager(dataset_json)
         if ('LesionLocator_compile' in os.environ.keys()) and (os.environ['LesionLocator_compile'].lower() in ('true', '1', 't')) \
                 and not isinstance(self.network, OptimizedModule):
+            import shutil
+            if shutil.which('gcc') is None and shutil.which('cc') is None:
+                raise RuntimeError(
+                    "LesionLocator_compile=1 is set but no C compiler found on PATH (gcc/cc). "
+                    "torch.compile inductor backend JIT-compiles C++ kernels and will fail silently per-batch. "
+                    "Install build-essential in the Docker image, or unset LesionLocator_compile to run eager."
+                )
             print('Using torch.compile')
             self.network = torch.compile(self.network)
 
