@@ -131,12 +131,12 @@ def _raise_if_fatal_cuda_error(error: Exception, phase: str, batch_idx: int, dev
 
 
 def _is_fatal_worker_error(error: Exception) -> bool:
-    # Preprocessing worker killed by cgroup OOM-killer (SIGKILL on child) propagates as broken pipe/EOF.
-    # These are non-recoverable: all workers for this epoch are gone; continuing silently skips all batches.
-    if isinstance(error, (BrokenPipeError, EOFError, ConnectionResetError)):
-        return True
+    # Matches RuntimeError raised by the custom preprocessing iterator when a cgroup OOM-killer
+    # kills a worker child. Do NOT use isinstance(BrokenPipeError/EOFError) — those also fire on
+    # a broken stdout/tee pipe inside the batch try-block, causing false-positive aborts.
     message = str(error)
     return any(token in message for token in (
+        'Background workers died',
         'DataLoader worker',
         'is killed by signal',
         'worker exited unexpectedly',
@@ -147,7 +147,9 @@ def _raise_if_fatal_worker_error(error: Exception, phase: str, batch_idx: int, d
     if _is_fatal_worker_error(error):
         print(f"Fatal preprocessing/worker error in {phase} batch {batch_idx}; aborting this run.")
         _maybe_empty_cache(device)
-        raise error
+        raise RuntimeError(
+            f"Fatal preprocessing/worker error in {phase} batch {batch_idx}"
+        ) from error
 
 
 def _safe_mean(values) -> float:
@@ -1968,7 +1970,15 @@ class LesionLocatorSegmenter(object):
             print(f"\nFold {fold_idx}, Epoch {epoch+1}/{epochs}")
             print("Training...")
 
-            for batch_idx, batch in enumerate(train_dataloader):
+            _train_dl_iter = enumerate(train_dataloader)
+            while True:
+                try:
+                    batch_idx, batch = next(_train_dl_iter)
+                except StopIteration:
+                    break
+                except Exception as e:
+                    _raise_if_fatal_worker_error(e, 'training-iterator', -1, device)
+                    raise
                 try:
                     data = batch['data'].to(device, non_blocking=True)
                     prompt = batch['prompt'].to(device, non_blocking=True)
@@ -2021,7 +2031,15 @@ class LesionLocatorSegmenter(object):
 
             print("Validating (loss computation on CV fold)...")
             with torch.inference_mode():
-                for batch_idx, batch in enumerate(val_dataloader):
+                _val_dl_iter = enumerate(val_dataloader)
+                while True:
+                    try:
+                        batch_idx, batch = next(_val_dl_iter)
+                    except StopIteration:
+                        break
+                    except Exception as e:
+                        _raise_if_fatal_worker_error(e, 'validation-iterator', -1, device)
+                        raise
                     try:
                         data = batch['data'].to(device, non_blocking=True)
                         prompt = batch['prompt'].to(device, non_blocking=True)
@@ -2069,7 +2087,15 @@ class LesionLocatorSegmenter(object):
                 epoch_test_dice_scores = []
 
                 with torch.inference_mode():
-                    for batch_idx, batch in enumerate(test_dataloader):
+                    _test_dl_iter = enumerate(test_dataloader)
+                    while True:
+                        try:
+                            batch_idx, batch = next(_test_dl_iter)
+                        except StopIteration:
+                            break
+                        except Exception as e:
+                            _raise_if_fatal_worker_error(e, 'test-iterator', -1, device)
+                            raise
                         try:
                             data = batch['data'].to(device, non_blocking=True)
                             prompt = batch['prompt'].to(device, non_blocking=True)
