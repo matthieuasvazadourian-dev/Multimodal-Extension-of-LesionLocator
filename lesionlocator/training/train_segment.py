@@ -294,8 +294,10 @@ class LesionDatasetWrapper(IterableDataset):
             yield from self._cache
             return
 
-        if self.use_cache:
-            self._cache = []
+        # Build into a local list and commit only on full success.
+        # Assigning self._cache = [] before iteration would leave a partial cache
+        # if any exception escapes the loop, causing epochs 2+ to replay an incomplete set.
+        _new_cache = [] if self.use_cache else None
 
         data_iterator = preprocessing_iterator_fromfiles(
             self.input_files, self.prompt_files, self.output_files,
@@ -357,11 +359,12 @@ class LesionDatasetWrapper(IterableDataset):
                     'lesion_id': mask_id,
                     'filename': preprocessed['ofile']
                 }
-                if self.use_cache:
-                    self._cache.append(sample)
+                if _new_cache is not None:
+                    _new_cache.append(sample)
                 yield sample
 
-        if self.use_cache:
+        if _new_cache is not None:
+            self._cache = _new_cache
             print(f'Preprocessing cache built: {len(self._cache)} samples. Subsequent epochs served from RAM.')
 
 
@@ -2740,7 +2743,8 @@ def train_from_prompt():
             prompt_type=args.t,
             num_processes=args.npp,
             verbose=args.verbose,
-            track=args.track
+            track=args.track,
+            use_cache=args.cache,
         )
         print(f"Test dataset created with {len(test_input_files)} samples")
     
