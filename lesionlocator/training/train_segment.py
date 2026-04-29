@@ -130,6 +130,26 @@ def _raise_if_fatal_cuda_error(error: Exception, phase: str, batch_idx: int, dev
         raise error
 
 
+def _is_fatal_worker_error(error: Exception) -> bool:
+    # Preprocessing worker killed by cgroup OOM-killer (SIGKILL on child) propagates as broken pipe/EOF.
+    # These are non-recoverable: all workers for this epoch are gone; continuing silently skips all batches.
+    if isinstance(error, (BrokenPipeError, EOFError, ConnectionResetError)):
+        return True
+    message = str(error)
+    return any(token in message for token in (
+        'DataLoader worker',
+        'is killed by signal',
+        'worker exited unexpectedly',
+    ))
+
+
+def _raise_if_fatal_worker_error(error: Exception, phase: str, batch_idx: int, device: torch.device):
+    if _is_fatal_worker_error(error):
+        print(f"Fatal preprocessing/worker error in {phase} batch {batch_idx}; aborting this run.")
+        _maybe_empty_cache(device)
+        raise error
+
+
 def _safe_mean(values) -> float:
     return float(np.mean(values)) if len(values) > 0 else 0.0
 
@@ -1983,6 +2003,7 @@ class LesionLocatorSegmenter(object):
                 except Exception as e:
                     print(f"Error in training batch {batch_idx}: {e}")
                     _raise_if_fatal_cuda_error(e, 'training', batch_idx, device)
+                    _raise_if_fatal_worker_error(e, 'training', batch_idx, device)
                     _maybe_empty_cache(device)
                     continue
 
@@ -2025,6 +2046,7 @@ class LesionLocatorSegmenter(object):
                     except Exception as e:
                         print(f"Error in validation batch {batch_idx}: {e}")
                         _raise_if_fatal_cuda_error(e, 'validation', batch_idx, device)
+                        _raise_if_fatal_worker_error(e, 'validation', batch_idx, device)
                         _maybe_empty_cache(device)
                         continue
 
@@ -2093,6 +2115,7 @@ class LesionLocatorSegmenter(object):
                         except Exception as e:
                             print(f"Error in test batch {batch_idx}: {e}")
                             _raise_if_fatal_cuda_error(e, 'test', batch_idx, device)
+                            _raise_if_fatal_worker_error(e, 'test', batch_idx, device)
                             _maybe_empty_cache(device)
                             continue
 
