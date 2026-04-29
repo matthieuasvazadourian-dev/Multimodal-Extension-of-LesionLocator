@@ -378,6 +378,11 @@ class LesionDatasetWrapper(IterableDataset):
                     _new_cache.append(sample)
                 yield sample
 
+        # Release the iterator immediately so its internal multiprocessing queue
+        # and any lingering worker references are dropped before we commit the cache.
+        del data_iterator
+        gc.collect()
+
         if _new_cache is not None:
             self._cache = _new_cache
             print(
