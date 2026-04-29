@@ -42,11 +42,11 @@ LesionLocator_train_segment \
   --epochs 50 \
   --batch_size 1 \
   --lr 5e-5 \
-  --num_workers 6 \
+  --num_workers 3 \
   --finetune first_conv \
   --train_fold $FOLD \
   --ckpt_path $CKPT_OUT \
-  -npp 6 \
+  -npp 3 \
   -nps 2 \
   -device cuda \
   --cache \

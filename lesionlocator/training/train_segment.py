@@ -112,6 +112,19 @@ def _process_tree_rss_gb() -> float:
     return total / (1024 ** 3)
 
 
+def _tensor_cache_size_gb(samples) -> float:
+    seen = set()
+    total = 0
+    for sample in samples:
+        for value in sample.values():
+            if isinstance(value, torch.Tensor):
+                ident = id(value)
+                if ident not in seen:
+                    seen.add(ident)
+                    total += value.numel() * value.element_size()
+    return total / (1024 ** 3)
+
+
 def _is_fatal_cuda_error(error: Exception) -> bool:
     if isinstance(error, torch.cuda.OutOfMemoryError):
         return True
@@ -339,10 +352,12 @@ class LesionDatasetWrapper(IterableDataset):
                 else:
                     data_tensor = torch.from_numpy(data).float()
 
+                # Prompts are binary 0/1 masks. Keep them compact in RAM and
+                # cast back to the image dtype immediately before torch.cat.
                 if isinstance(p_dense, torch.Tensor):
-                    prompt_tensor = p_dense.float()
+                    prompt_tensor = p_dense.byte()
                 else:
-                    prompt_tensor = torch.from_numpy(p_dense).float()
+                    prompt_tensor = torch.from_numpy(p_dense).byte()
 
                 # Store as uint8 (binary 0/1) — 8× less RAM than int64.
                 # The loss casts to .long() internally so this is transparent.
@@ -365,7 +380,12 @@ class LesionDatasetWrapper(IterableDataset):
 
         if _new_cache is not None:
             self._cache = _new_cache
-            print(f'Preprocessing cache built: {len(self._cache)} samples. Subsequent epochs served from RAM.')
+            print(
+                f'Preprocessing cache built: {len(self._cache)} samples. '
+                f'Approx tensor cache: {_tensor_cache_size_gb(self._cache):.2f} GB. '
+                f'Process-tree RAM: {_process_tree_rss_gb():.2f} GB. '
+                f'Subsequent epochs served from RAM.'
+            )
 
 
 def training_collate_fn(batch):
@@ -1984,7 +2004,7 @@ class LesionLocatorSegmenter(object):
                     raise
                 try:
                     data = batch['data'].to(device, non_blocking=True)
-                    prompt = batch['prompt'].to(device, non_blocking=True)
+                    prompt = batch['prompt'].to(device, dtype=data.dtype, non_blocking=True)
                     target = batch['target'].to(device, non_blocking=True)
 
                     if data.dim() == 4:
@@ -2045,7 +2065,7 @@ class LesionLocatorSegmenter(object):
                         raise
                     try:
                         data = batch['data'].to(device, non_blocking=True)
-                        prompt = batch['prompt'].to(device, non_blocking=True)
+                        prompt = batch['prompt'].to(device, dtype=data.dtype, non_blocking=True)
                         target = batch['target'].to(device, non_blocking=True)
 
                         if data.dim() == 4:
@@ -2101,7 +2121,7 @@ class LesionLocatorSegmenter(object):
                             raise
                         try:
                             data = batch['data'].to(device, non_blocking=True)
-                            prompt = batch['prompt'].to(device, non_blocking=True)
+                            prompt = batch['prompt'].to(device, dtype=data.dtype, non_blocking=True)
                             target = batch['target'].to(device, non_blocking=True)
                             filenames = batch['filename']
 
@@ -2263,7 +2283,7 @@ class LesionLocatorSegmenter(object):
                 try:
                     # Extract data from batch
                     data = batch['data'].to(device, non_blocking=True)      # [B, C, H, W, D] or [C, H, W, D]
-                    prompt = batch['prompt'].to(device, non_blocking=True)  # [B, 1, H, W, D] or [1, H, W, D]
+                    prompt = batch['prompt'].to(device, dtype=data.dtype, non_blocking=True)  # [B, 1, H, W, D] or [1, H, W, D]
                     target = batch['target'].to(device, non_blocking=True)  # [B, H, W, D] or [H, W, D]
                     print('Data shape ', data.shape)
                     print('Prompt shape ', prompt.shape)
@@ -2320,7 +2340,7 @@ class LesionLocatorSegmenter(object):
                         try:
                             # Extract data from batch
                             data = batch['data'].to(device, non_blocking=True)      # [B, C, H, W, D] or [C, H, W, D]
-                            prompt = batch['prompt'].to(device, non_blocking=True)  # [B, 1, H, W, D] or [1, H, W, D]
+                            prompt = batch['prompt'].to(device, dtype=data.dtype, non_blocking=True)  # [B, 1, H, W, D] or [1, H, W, D]
                             target = batch['target'].to(device, non_blocking=True)  # [B, H, W, D] or [H, W, D]
                             properties = batch['properties']     # Metadata
                             filenames = batch['filename']        # Filenames for visualization
@@ -2506,7 +2526,8 @@ class LesionLocatorSegmenter(object):
             modality = self.modality,
             # configuration_manager=self.configuration_manager,
             num_processes=num_processes,
-            pin_memory=self.device.type == 'cuda',
+            # Do not pin tensors that will live in the RAM cache for the full run.
+            pin_memory=self.device.type == 'cuda' and not use_cache,
             verbose=verbose,
             track=track,
             use_cache=use_cache,
