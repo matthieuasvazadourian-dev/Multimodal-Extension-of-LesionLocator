@@ -383,6 +383,16 @@ class LesionDatasetWrapper(IterableDataset):
             # forward/backward pass never reads them and they cost 1-5 MB/case.
             properties_for_cache = {k: v for k, v in properties.items() if k != 'class_locations'}
 
+            # Convert image data once per case and clone once to break the worker's
+            # /dev/shm linkage. All lesion samples from this case share the same
+            # case_data_tensor ref — no per-lesion re-clone of the full image volume.
+            if isinstance(data, torch.Tensor):
+                case_data_tensor = data.float()
+            else:
+                case_data_tensor = torch.from_numpy(data).float()
+            if _new_cache is not None:
+                case_data_tensor = case_data_tensor.clone()
+
             # Convert each lesion instance into a training sample
             for inst_id, p in enumerate(prompt):
                 if len(p) == 0:
@@ -400,10 +410,7 @@ class LesionDatasetWrapper(IterableDataset):
                 if p_dense is None:
                     continue
 
-                if isinstance(data, torch.Tensor):
-                    data_tensor = data.float()
-                else:
-                    data_tensor = torch.from_numpy(data).float()
+                data_tensor = case_data_tensor
 
                 # Prompts are binary 0/1 masks. Keep them compact in RAM and
                 # cast back to the image dtype immediately before torch.cat.
@@ -419,11 +426,8 @@ class LesionDatasetWrapper(IterableDataset):
                 else:
                     target_tensor = torch.from_numpy(gt_mask[0]).byte()
 
-                # When caching: clone tensors to break /dev/shm linkage from the worker.
-                # Without this, cached tensors keep worker shm files alive in tmpfs
-                # (counted by cgroup but not psutil RSS) until the process exits.
+                # Prompt/target are per-lesion: clone each to break shm linkage.
                 if _new_cache is not None:
-                    data_tensor = data_tensor.clone()
                     prompt_tensor = prompt_tensor.clone()
                     target_tensor = target_tensor.clone()
 
@@ -438,6 +442,10 @@ class LesionDatasetWrapper(IterableDataset):
                 if _new_cache is not None:
                     _new_cache.append(sample)
                 yield sample
+
+            # Drop per-case locals so the last case's shm-backed tensors are
+            # released before the next case arrives (or before cache commit).
+            del preprocessed, data, prompt, seg_mask, properties, properties_for_cache, case_data_tensor
 
         # Release the iterator immediately so its internal multiprocessing queue
         # and any lingering worker references are dropped before we commit the cache.
