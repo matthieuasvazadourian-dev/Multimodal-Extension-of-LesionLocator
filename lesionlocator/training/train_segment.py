@@ -325,7 +325,7 @@ class LesionDatasetWrapper(IterableDataset):
             print(f'Data iterator created. Streaming {len(self.input_files)} cases through {self.num_processes} preprocessing workers...', flush=True)
 
         for case_idx, preprocessed in enumerate(data_iterator):
-            if case_idx % 10 == 0:
+            if self.use_cache and case_idx % 10 == 0:
                 print(
                     f'[cache build] case {case_idx}/{len(self.input_files)}, '
                     f'process-tree RAM: {_process_tree_rss_gb():.1f} GB',
