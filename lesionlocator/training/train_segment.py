@@ -324,11 +324,20 @@ class LesionDatasetWrapper(IterableDataset):
         else:
             print(f'Data iterator created. Streaming {len(self.input_files)} cases through {self.num_processes} preprocessing workers...', flush=True)
 
-        for preprocessed in data_iterator:
+        for case_idx, preprocessed in enumerate(data_iterator):
+            if case_idx % 10 == 0:
+                print(
+                    f'[cache build] case {case_idx}/{len(self.input_files)}, '
+                    f'process-tree RAM: {_process_tree_rss_gb():.1f} GB',
+                    flush=True,
+                )
             data = preprocessed['data']
             prompt = preprocessed['prompt']
             seg_mask = preprocessed['seg']
             properties = preprocessed['data_properties']
+            # Strip large voxel-coord arrays from the cached copy; the training
+            # forward/backward pass never reads them and they cost 1-5 MB/case.
+            properties_for_cache = {k: v for k, v in properties.items() if k != 'class_locations'}
 
             # Convert each lesion instance into a training sample
             for inst_id, p in enumerate(prompt):
@@ -370,7 +379,7 @@ class LesionDatasetWrapper(IterableDataset):
                     'data': data_tensor,        # [C, H, W, D]
                     'prompt': prompt_tensor,    # [1, H, W, D]
                     'target': target_tensor,    # [H, W, D]
-                    'properties': properties,
+                    'properties': properties_for_cache if _new_cache is not None else properties,
                     'lesion_id': mask_id,
                     'filename': preprocessed['ofile']
                 }
