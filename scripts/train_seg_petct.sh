@@ -30,6 +30,7 @@ export CUDA_VISIBLE_DEVICES=0
 export LesionLocator_compile=1
 export MALLOC_ARENA_MAX=2
 export MALLOC_TRIM_THRESHOLD_=131072
+export MALLOC_MMAP_THRESHOLD_=65536
 
 LesionLocator_train_segment \
   -i  $TRAIN_DATA \
