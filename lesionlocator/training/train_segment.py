@@ -114,11 +114,26 @@ def _process_tree_rss_gb() -> float:
 
 def _cgroup_memory_gb() -> float:
     """Total container memory (RSS + page cache) as seen by the cgroup — matches RunAI graph."""
+    import os as _os
+    # cgroup v1
     try:
         with open('/sys/fs/cgroup/memory/memory.usage_in_bytes') as f:
             return int(f.read().strip()) / (1024 ** 3)
     except (OSError, FileNotFoundError):
-        return float('nan')
+        pass
+    # cgroup v2: derive path from /proc/self/cgroup (line "0::<rel_path>")
+    try:
+        with open('/proc/self/cgroup') as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith('0::'):
+                    cg_rel = line[3:].lstrip('/')  # "" when at root cgroup
+                    path = _os.path.join('/sys/fs/cgroup', cg_rel, 'memory.current')
+                    with open(path) as mf:
+                        return int(mf.read().strip()) / (1024 ** 3)
+    except (OSError, FileNotFoundError):
+        pass
+    return float('nan')
 
 
 def _tensor_cache_size_gb(samples) -> float:
