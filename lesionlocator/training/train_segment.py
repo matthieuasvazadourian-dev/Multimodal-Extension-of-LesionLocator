@@ -114,14 +114,11 @@ def _process_tree_rss_gb() -> float:
 
 def _cgroup_memory_gb() -> float:
     """Total container memory (RSS + page cache) as seen by the cgroup — matches RunAI graph."""
-    for path in ('/sys/fs/cgroup/memory/memory.usage_in_bytes',
-                 '/sys/fs/cgroup/memory.current'):
-        try:
-            with open(path) as f:
-                return int(f.read().strip()) / (1024 ** 3)
-        except (OSError, FileNotFoundError):
-            pass
-    return float('nan')
+    try:
+        with open('/sys/fs/cgroup/memory/memory.usage_in_bytes') as f:
+            return int(f.read().strip()) / (1024 ** 3)
+    except (OSError, FileNotFoundError):
+        return float('nan')
 
 
 def _tensor_cache_size_gb(samples) -> float:
@@ -410,7 +407,8 @@ class LesionDatasetWrapper(IterableDataset):
             print(
                 f'Preprocessing cache built: {len(self._cache)} samples. '
                 f'Approx tensor cache: {_tensor_cache_size_gb(self._cache):.2f} GB. '
-                f'Process-tree RAM: {_process_tree_rss_gb():.2f} GB. '
+                f'cgroup RAM: {_cgroup_memory_gb():.2f} GB '
+                f'(RSS: {_process_tree_rss_gb():.2f} GB). '
                 f'Subsequent epochs served from RAM.'
             )
 
