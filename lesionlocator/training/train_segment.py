@@ -136,6 +136,23 @@ def _cgroup_memory_gb() -> float:
     return float('nan')
 
 
+def _cgroup_memory_peak_gb() -> float:
+    """High-water mark since process start (cgroup v2 only, kernel ≥ 5.13). Returns nan if unavailable."""
+    import os as _os
+    try:
+        with open('/proc/self/cgroup') as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith('0::'):
+                    cg_rel = line[3:].lstrip('/')
+                    path = _os.path.join('/sys/fs/cgroup', cg_rel, 'memory.peak')
+                    with open(path) as mf:
+                        return int(mf.read().strip()) / (1024 ** 3)
+    except (OSError, FileNotFoundError):
+        pass
+    return float('nan')
+
+
 def _tensor_cache_size_gb(samples) -> float:
     seen = set()
     total = 0
@@ -350,10 +367,12 @@ class LesionDatasetWrapper(IterableDataset):
 
         for case_idx, preprocessed in enumerate(data_iterator):
             if self.use_cache and case_idx % 10 == 0:
+                peak = _cgroup_memory_peak_gb()
+                peak_str = f', peak: {peak:.1f} GB' if peak == peak else ''
                 print(
                     f'[cache build] case {case_idx}/{len(self.input_files)}, '
-                    f'cgroup RAM: {_cgroup_memory_gb():.1f} GB '
-                    f'(RSS: {_process_tree_rss_gb():.1f} GB)',
+                    f'cgroup RAM: {_cgroup_memory_gb():.1f} GB'
+                    f'{peak_str} (RSS: {_process_tree_rss_gb():.1f} GB)',
                     flush=True,
                 )
             data = preprocessed['data']
@@ -400,6 +419,14 @@ class LesionDatasetWrapper(IterableDataset):
                 else:
                     target_tensor = torch.from_numpy(gt_mask[0]).byte()
 
+                # When caching: clone tensors to break /dev/shm linkage from the worker.
+                # Without this, cached tensors keep worker shm files alive in tmpfs
+                # (counted by cgroup but not psutil RSS) until the process exits.
+                if _new_cache is not None:
+                    data_tensor = data_tensor.clone()
+                    prompt_tensor = prompt_tensor.clone()
+                    target_tensor = target_tensor.clone()
+
                 sample = {
                     'data': data_tensor,        # [C, H, W, D]
                     'prompt': prompt_tensor,    # [1, H, W, D]
@@ -419,11 +446,13 @@ class LesionDatasetWrapper(IterableDataset):
 
         if _new_cache is not None:
             self._cache = _new_cache
+            peak = _cgroup_memory_peak_gb()
+            peak_str = f', peak: {peak:.2f} GB' if peak == peak else ''
             print(
                 f'Preprocessing cache built: {len(self._cache)} samples. '
                 f'Approx tensor cache: {_tensor_cache_size_gb(self._cache):.2f} GB. '
-                f'cgroup RAM: {_cgroup_memory_gb():.2f} GB '
-                f'(RSS: {_process_tree_rss_gb():.2f} GB). '
+                f'cgroup RAM: {_cgroup_memory_gb():.2f} GB'
+                f'{peak_str} (RSS: {_process_tree_rss_gb():.2f} GB). '
                 f'Subsequent epochs served from RAM.'
             )
 
