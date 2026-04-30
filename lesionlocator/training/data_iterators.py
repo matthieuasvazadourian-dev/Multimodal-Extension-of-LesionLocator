@@ -20,6 +20,16 @@ from lesionlocator.utilities.prompt_handling.prompt_handler import get_prompt_fr
 
 import numpy as np
 
+
+def _fadvise_dontneed(filepath: str) -> None:
+    """Advise kernel to evict this file's pages from page cache after reading."""
+    try:
+        with open(filepath, 'rb') as f:
+            os.posix_fadvise(f.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+    except (OSError, AttributeError):
+        pass
+
+
 def preprocess_fromfiles_save_to_queue(input_files: List[str],
                                        prompt_files: List[str],
                                        output_files: List[str],
@@ -61,8 +71,8 @@ def preprocess_fromfiles_save_to_queue(input_files: List[str],
                                                                                                 configuration_manager,
                                                                                                 dataset_json,
                                                                                                 track)
-
-
+                for f in _image_files:
+                    _fadvise_dontneed(f)
                 prompt = get_prompt_from_json(prompt_files[idx], prompt_type, data_properties, data.shape[1:])
             else:
                 data, seg, data_properties, bl_data, bl_data_properties = preprocessor.run_case(_image_files,
@@ -71,6 +81,9 @@ def preprocess_fromfiles_save_to_queue(input_files: List[str],
                                                                     configuration_manager,
                                                                     dataset_json,
                                                                     track, train=train)
+                for f in _image_files:
+                    _fadvise_dontneed(f)
+                _fadvise_dontneed(prompt_files[idx])
                 prompt = get_prompt_from_inst_or_bin_seg(seg, prompt_type)
             case_elapsed = time.time() - case_start
             print(f'[worker pid={worker_pid}] case {idx+1}/{len(input_files)} done in {case_elapsed:.1f}s', flush=True)
