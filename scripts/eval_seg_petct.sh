@@ -31,6 +31,6 @@ LesionLocator_track \
   -o  $OUTPUT \
   -f  $FOLD \
   -t  point \
-  -npp 1 -nps 1 \
+  -npp 6 -nps 3 \
   --modality petct \
   2>&1 | tee "$OUTPUT/eval_seg_pet_fold_$FOLD.txt"
