@@ -5,7 +5,6 @@ import gc
 import traceback
 import json
 import time
-import psutil
 import numpy as np
 from queue import Queue
 from threading import Thread
@@ -83,87 +82,6 @@ def _autocast_context(device: torch.device):
 def _maybe_empty_cache(device: torch.device):
     if _uses_cuda_device(device):
         torch.cuda.empty_cache()
-
-
-def _cuda_memory_allocated_gb(device: torch.device) -> float:
-    return torch.cuda.memory_allocated() / 1024**3 if _uses_cuda_device(device) else 0.0
-
-
-def _cuda_memory_reserved_gb(device: torch.device) -> float:
-    return torch.cuda.memory_reserved() / 1024**3 if _uses_cuda_device(device) else 0.0
-
-
-def _cuda_max_memory_allocated_gb(device: torch.device) -> float:
-    return torch.cuda.max_memory_allocated() / 1024**3 if _uses_cuda_device(device) else 0.0
-
-
-def _cuda_total_memory_gb(device: torch.device):
-    return torch.cuda.get_device_properties(0).total_memory / 1024**3 if _uses_cuda_device(device) else None
-
-
-def _process_tree_rss_gb() -> float:
-    proc = psutil.Process()
-    total = proc.memory_info().rss
-    for child in proc.children(recursive=True):
-        try:
-            total += child.memory_info().rss
-        except psutil.NoSuchProcess:
-            pass
-    return total / (1024 ** 3)
-
-
-def _cgroup_memory_gb() -> float:
-    """Total container memory (RSS + page cache) as seen by the cgroup — matches RunAI graph."""
-    import os as _os
-    # cgroup v1
-    try:
-        with open('/sys/fs/cgroup/memory/memory.usage_in_bytes') as f:
-            return int(f.read().strip()) / (1024 ** 3)
-    except (OSError, FileNotFoundError):
-        pass
-    # cgroup v2: derive path from /proc/self/cgroup (line "0::<rel_path>")
-    try:
-        with open('/proc/self/cgroup') as f:
-            for line in f:
-                line = line.strip()
-                if line.startswith('0::'):
-                    cg_rel = line[3:].lstrip('/')  # "" when at root cgroup
-                    path = _os.path.join('/sys/fs/cgroup', cg_rel, 'memory.current')
-                    with open(path) as mf:
-                        return int(mf.read().strip()) / (1024 ** 3)
-    except (OSError, FileNotFoundError):
-        pass
-    return float('nan')
-
-
-def _cgroup_memory_peak_gb() -> float:
-    """High-water mark since process start (cgroup v2 only, kernel ≥ 5.13). Returns nan if unavailable."""
-    import os as _os
-    try:
-        with open('/proc/self/cgroup') as f:
-            for line in f:
-                line = line.strip()
-                if line.startswith('0::'):
-                    cg_rel = line[3:].lstrip('/')
-                    path = _os.path.join('/sys/fs/cgroup', cg_rel, 'memory.peak')
-                    with open(path) as mf:
-                        return int(mf.read().strip()) / (1024 ** 3)
-    except (OSError, FileNotFoundError):
-        pass
-    return float('nan')
-
-
-def _tensor_cache_size_gb(samples) -> float:
-    seen = set()
-    total = 0
-    for sample in samples:
-        for value in sample.values():
-            if isinstance(value, torch.Tensor):
-                ident = id(value)
-                if ident not in seen:
-                    seen.add(ident)
-                    total += value.numel() * value.element_size()
-    return total / (1024 ** 3)
 
 
 def _is_fatal_cuda_error(error: Exception) -> bool:
@@ -365,16 +283,7 @@ class LesionDatasetWrapper(IterableDataset):
         else:
             print(f'Data iterator created. Streaming {len(self.input_files)} cases through {self.num_processes} preprocessing workers...', flush=True)
 
-        for case_idx, preprocessed in enumerate(data_iterator):
-            if self.use_cache and case_idx % 10 == 0:
-                peak = _cgroup_memory_peak_gb()
-                peak_str = f', peak: {peak:.1f} GB' if peak == peak else ''
-                print(
-                    f'[cache build] case {case_idx}/{len(self.input_files)}, '
-                    f'cgroup RAM: {_cgroup_memory_gb():.1f} GB'
-                    f'{peak_str} (RSS: {_process_tree_rss_gb():.1f} GB)',
-                    flush=True,
-                )
+        for preprocessed in data_iterator:
             data = preprocessed['data']
             prompt = preprocessed['prompt']
             seg_mask = preprocessed['seg']
@@ -454,15 +363,7 @@ class LesionDatasetWrapper(IterableDataset):
 
         if _new_cache is not None:
             self._cache = _new_cache
-            peak = _cgroup_memory_peak_gb()
-            peak_str = f', peak: {peak:.2f} GB' if peak == peak else ''
-            print(
-                f'Preprocessing cache built: {len(self._cache)} samples. '
-                f'Approx tensor cache: {_tensor_cache_size_gb(self._cache):.2f} GB. '
-                f'cgroup RAM: {_cgroup_memory_gb():.2f} GB'
-                f'{peak_str} (RSS: {_process_tree_rss_gb():.2f} GB). '
-                f'Subsequent epochs served from RAM.'
-            )
+            print(f'Preprocessing cache built: {len(self._cache)} samples. Subsequent epochs served from RAM.', flush=True)
 
 
 def training_collate_fn(batch):
@@ -504,7 +405,6 @@ def prev_training_collate_fn(batch):
     batch_lesion_ids = []
     batch_filenames = []
 
-    start_time = time.time()
     for item in batch:
         batch_data.append(item['data'])
         batch_prompts.append(item['prompt'])
@@ -512,15 +412,13 @@ def prev_training_collate_fn(batch):
         batch_properties.append(item['properties'])
         batch_lesion_ids.append(item['lesion_id'])
         batch_filenames.append(item['filename'])
-    
+
     # Stack tensors - all should have same dimensions due to crop_to_patch_size
     try:
         stacked_data = torch.stack(batch_data, dim=0)       # [B, C, H, W, D]
         stacked_prompts = torch.stack(batch_prompts, dim=0) # [B, 1, H, W, D]
         stacked_targets = torch.stack(batch_targets, dim=0) # [B, H, W, D]
-        
-        end_time = time.time()
-        print(f'Batch stacked in {end_time - start_time:.4f} seconds')
+
         return {
             'data': stacked_data,
             'prompt': stacked_prompts,
@@ -1903,8 +1801,8 @@ class LesionLocatorSegmenter(object):
             all_fold_results.append(fold_results)
             gc.collect()
             if _uses_cuda_device(device):
-                print(f"GPU memory allocated: {_cuda_memory_allocated_gb(device):.2f} GB")
-                print(f"GPU memory reserved: {_cuda_memory_reserved_gb(device):.2f} GB")
+                print(f"GPU memory allocated: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
+                print(f"GPU memory reserved: {torch.cuda.memory_reserved() / 1024**3:.2f} GB")
 
             print(f"Fold {fold_idx+1} completed!")
             print(f"Best validation loss: {fold_results['best_val_loss']:.4f}")
@@ -2061,7 +1959,6 @@ class LesionLocatorSegmenter(object):
 
         for epoch in range(start_epoch, epochs):
             epoch_start = time.time()
-            _epoch_rss_peak_gb = _process_tree_rss_gb()
             # Training phase
             self.network.train()
             epoch_train_loss = torch.zeros(1, device=device)
@@ -2120,7 +2017,6 @@ class LesionLocatorSegmenter(object):
             avg_train_loss = (epoch_train_loss / max(num_train_batches, 1)).item()
             fold_train_losses.append(avg_train_loss)
             train_time = time.time() - epoch_start
-            _epoch_rss_peak_gb = max(_epoch_rss_peak_gb, _process_tree_rss_gb())
             print(f"Training Loss: {avg_train_loss:.4f}  ({train_time:.1f}s)")
             
             # Validation phase (for loss computation only)
@@ -2171,7 +2067,6 @@ class LesionLocatorSegmenter(object):
             avg_val_loss = (epoch_val_loss / max(num_val_batches, 1)).item()
             fold_val_losses.append(avg_val_loss)
             val_time = time.time() - val_start
-            _epoch_rss_peak_gb = max(_epoch_rss_peak_gb, _process_tree_rss_gb())
             print(f"Validation Loss: {avg_val_loss:.4f}  ({val_time:.1f}s)")
             
             # Test phase (for dice computation and visualization)
@@ -2247,16 +2142,7 @@ class LesionLocatorSegmenter(object):
 
                 avg_test_dice = np.mean(epoch_test_dice_scores) if epoch_test_dice_scores else 0.0
                 fold_test_dice_scores.append(avg_test_dice)
-                _epoch_rss_peak_gb = max(_epoch_rss_peak_gb, _process_tree_rss_gb())
                 print(f"Test Dice Score: {avg_test_dice:.4f}")
-
-            # Epoch-level memory summary (one line per epoch, no per-batch sync)
-            print(f"  RAM peak (host+workers): {_epoch_rss_peak_gb:.2f} GB")
-            if _uses_cuda_device(device):
-                print(f"  GPU mem — allocated: {_cuda_memory_allocated_gb(device):.2f} GB  "
-                      f"peak: {torch.cuda.max_memory_allocated(device) / 1e9:.2f} GB  "
-                      f"reserved: {_cuda_memory_reserved_gb(device):.2f} GB")
-                torch.cuda.reset_peak_memory_stats(device)
 
             # Update learning rate scheduler
             if self.scheduler:

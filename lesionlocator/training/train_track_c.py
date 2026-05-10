@@ -89,21 +89,6 @@ def _maybe_empty_cache(device: torch.device):
         torch.cuda.empty_cache()
 
 
-def _cuda_memory_allocated_gb(device: torch.device) -> float:
-    return torch.cuda.memory_allocated() / 1024**3 if _uses_cuda_device(device) else 0.0
-
-
-def _cuda_memory_reserved_gb(device: torch.device) -> float:
-    return torch.cuda.memory_reserved() / 1024**3 if _uses_cuda_device(device) else 0.0
-
-
-def _cuda_max_memory_allocated_gb(device: torch.device) -> float:
-    return torch.cuda.max_memory_allocated() / 1024**3 if _uses_cuda_device(device) else 0.0
-
-
-def _cuda_total_memory_gb(device: torch.device):
-    return torch.cuda.get_device_properties(0).total_memory / 1024**3 if _uses_cuda_device(device) else None
-
 def unique_ids_to_indices(id_to_indices, unique_ids):
     indices = []
         
@@ -1316,8 +1301,8 @@ class LesionLocatorTrack(object):
             all_fold_results.append(fold_results)
             gc.collect()
             if _uses_cuda_device(device):
-                print(f"GPU memory allocated: {_cuda_memory_allocated_gb(device):.2f} GB")
-                print(f"GPU memory reserved: {_cuda_memory_reserved_gb(device):.2f} GB")
+                print(f"GPU memory allocated: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
+                print(f"GPU memory reserved: {torch.cuda.memory_reserved() / 1024**3:.2f} GB")
 
             print(f"Fold {fold_idx+1} completed!")
             print(f"Best validation loss: {fold_results['best_val_loss']:.4f}")
@@ -1325,7 +1310,7 @@ class LesionLocatorTrack(object):
                 print(f"Final test dice: {fold_results['test_dice_scores'][-1]:.4f}")
 
             _maybe_empty_cache(device)
-        
+
         # Compute cross-validation statistics
         final_val_losses = [fold['val_losses'][-1] for fold in all_fold_results]
         best_val_losses = [fold['best_val_loss'] for fold in all_fold_results]
@@ -1503,11 +1488,8 @@ class LesionLocatorTrack(object):
                     num_train_batches += 1
                     
                     _maybe_empty_cache(device)
-                    #if batch_idx % 10 == 0:
-                    print(f"  Batch {batch_idx}, Loss: {loss.item():.4f}")
-                    if _uses_cuda_device(device):
-                        print(f"  GPU memory allocated: {_cuda_memory_allocated_gb(device):.2f} GB")
-                        print(f"  GPU memory reserved: {_cuda_memory_reserved_gb(device):.2f} GB")
+                    if batch_idx % 10 == 0:
+                        print(f"  Batch {batch_idx}, Loss: {loss.item():.4f}")
                         
                 except Exception as e:
                     print(f"Error in training batch {batch_idx}: {e}")
@@ -1817,13 +1799,8 @@ class LesionLocatorTrack(object):
         import gc
         gc.collect()
         
-        # Print initial memory status
-        if _uses_cuda_device(device):
-            print(f"Initial GPU memory: {_cuda_memory_allocated_gb(device):.2f} GB allocated")
-            print(f"Total GPU memory: {_cuda_total_memory_gb(device):.2f} GB")
-        
         # Suggest memory-efficient settings if memory is limited
-        total_memory = _cuda_total_memory_gb(device)
+        total_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3 if _uses_cuda_device(device) else None
         if total_memory is not None and total_memory < 12:  # Less than 12GB
             print("WARNING: Limited GPU memory detected. Consider:")
             print("  - Using batch_size=1 and gradient_accumulation_steps=2-4")
@@ -1959,9 +1936,6 @@ class LesionLocatorTrack(object):
                         if "out of memory" in str(e):
                             oom_count += 1
                             print(f"CUDA OOM in backward pass at batch {batch_idx} (OOM #{oom_count}). Clearing cache and skipping batch.")
-                            if _uses_cuda_device(device):
-                                print(f"Current GPU memory: {_cuda_memory_allocated_gb(device):.2f} GB allocated, {_cuda_memory_reserved_gb(device):.2f} GB reserved")
-                            
                             if oom_count >= max_oom_retries:
                                 print(f"Too many OOM errors ({oom_count}). Consider reducing batch size or gradient accumulation steps.")
                                 print("Suggested fixes:")
@@ -1997,15 +1971,11 @@ class LesionLocatorTrack(object):
                     import gc
                     gc.collect()
                     
-                    if batch_idx % 10 == 0:  # Less frequent reporting
+                    if batch_idx % 10 == 0:
                         print(f"  Batch {batch_idx}")
                         print(f"    Total Loss: {epoch_train_loss/num_train_batches:.4f}")
                         print(f"    Seg Loss: {epoch_seg_loss/num_train_batches:.4f}")
                         print(f"    Reg Loss: {epoch_reg_loss/num_train_batches:.4f}")
-                        if _uses_cuda_device(device):
-                            print(f"    GPU memory allocated: {_cuda_memory_allocated_gb(device):.2f} GB")
-                            print(f"    GPU memory reserved: {_cuda_memory_reserved_gb(device):.2f} GB")
-                            print(f"    Max GPU memory allocated: {_cuda_max_memory_allocated_gb(device):.2f} GB")
                         
                 except Exception as e:
                     print(f"Error in training batch {batch_idx}: {e}")
