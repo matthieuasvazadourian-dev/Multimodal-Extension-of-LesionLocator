@@ -13,6 +13,7 @@ python -m pip install -e . --quiet
 
 FOLD=${1:?"Usage: $0 <fold>"}
 
+# Paths — PET+CT dataset lives in home (symlinks to scratch NIfTIs, zero extra disk usage)
 TRAIN_DATA=/home/masva/datasets/Dataset900_USZMelanomaPETCT/imagesTr
 TRAIN_PROMPT=/home/masva/datasets/Dataset900_USZMelanomaPETCT/labelsTr
 VAL_DATA=/home/masva/datasets/Dataset901_USZMelanomaPETCT/imagesTr
