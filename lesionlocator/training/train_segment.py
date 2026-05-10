@@ -259,16 +259,12 @@ class LesionDatasetWrapper(IterableDataset):
     def __iter__(self):
         """
         Yield training samples. First epoch runs the full preprocessing pipeline and
-        caches every sample in RAM; subsequent epochs replay directly from cache,
-        avoiding repeated NIfTI reads, resampling, and worker-process spawning.
+        caches every sample in RAM and subsequent epochs replay directly from this cache
         """
         if self.use_cache and self._cache is not None:
             yield from self._cache
             return
 
-        # Build into a local list and commit only on full success.
-        # Assigning self._cache = [] before iteration would leave a partial cache
-        # if any exception escapes the loop, causing epochs 2+ to replay an incomplete set.
         _new_cache = [] if self.use_cache else None
 
         data_iterator = preprocessing_iterator_fromfiles(
@@ -288,13 +284,10 @@ class LesionDatasetWrapper(IterableDataset):
             prompt = preprocessed['prompt']
             seg_mask = preprocessed['seg']
             properties = preprocessed['data_properties']
-            # Strip large voxel-coord arrays from the cached copy; the training
-            # forward/backward pass never reads them and they cost 1-5 MB/case.
+            # As a small optimization we strip large voxel-coord arrays from the cached copy
             properties_for_cache = {k: v for k, v in properties.items() if k != 'class_locations'}
 
-            # Convert image data once per case and clone once to break the worker's
-            # /dev/shm linkage. All lesion samples from this case share the same
-            # case_data_tensor ref — no per-lesion re-clone of the full image volume.
+            # Convert image data once per case and clone once to break the worker's /dev/shm linkage.
             if isinstance(data, torch.Tensor):
                 case_data_tensor = data.float()
             else:
@@ -321,21 +314,20 @@ class LesionDatasetWrapper(IterableDataset):
 
                 data_tensor = case_data_tensor
 
-                # Prompts are binary 0/1 masks. Keep them compact in RAM and
+                # Prompts are binary 0/1 masks so we keep them compact in RAM and 
                 # cast back to the image dtype immediately before torch.cat.
                 if isinstance(p_dense, torch.Tensor):
                     prompt_tensor = p_dense.byte()
                 else:
                     prompt_tensor = torch.from_numpy(p_dense).byte()
 
-                # Store as uint8 (binary 0/1) — 8× less RAM than int64.
-                # The loss casts to .long() internally so this is transparent.
+                # We store as uint8 instead of int64
                 if isinstance(gt_mask[0], torch.Tensor):
                     target_tensor = gt_mask[0].byte()
                 else:
                     target_tensor = torch.from_numpy(gt_mask[0]).byte()
 
-                # Prompt/target are per-lesion: clone each to break shm linkage.
+                # We clone each to break shm linkage.
                 if _new_cache is not None:
                     prompt_tensor = prompt_tensor.clone()
                     target_tensor = target_tensor.clone()
@@ -352,11 +344,9 @@ class LesionDatasetWrapper(IterableDataset):
                     _new_cache.append(sample)
                 yield sample
 
-            # Drop per-case locals so the last case's shm-backed tensors are
-            # released before the next case arrives (or before cache commit).
             del preprocessed, data, prompt, seg_mask, properties, properties_for_cache, case_data_tensor
 
-        # Release the iterator immediately so its internal multiprocessing queue
+        # We release the iterator immediately so its internal multiprocessing queue
         # and any lingering worker references are dropped before we commit the cache.
         del data_iterator
         gc.collect()
