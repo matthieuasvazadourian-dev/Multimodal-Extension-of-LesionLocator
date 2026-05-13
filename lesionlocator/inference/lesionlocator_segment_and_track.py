@@ -176,11 +176,14 @@ class LesionLocatorSegmenter(object):
                                              model_track_training_output_dir: str,
                                              use_folds: Union[Tuple[Union[int, str]], None],
                                              modality: str = 'ct',
-                                             checkpoint_name: str = 'checkpoint_final.pth'):
+                                             checkpoint_name: str = 'checkpoint_final.pth',
+                                             fusion_arch: str = None):
         """
         This is used when making predictions with a trained model
         """
         print("Loading segmentation model.")
+        self.intermediate_fusion_mode = (fusion_arch is not None) and (modality == 'petct')
+        self.fusion_arch = fusion_arch
         if use_folds is None:
             use_folds = LesionLocatorSegmenter.auto_detect_available_folds(model_training_output_dir, checkpoint_name)
         dataset_json = load_json(join(model_training_output_dir, 'dataset.json'))
@@ -211,14 +214,14 @@ class LesionLocatorSegmenter(object):
 
             parameters.append(checkpoint['network_weights'])
 
-        # PET+CT early-fusion: patch dataset_json so that num_input_channels = 2 and
-        # extend the first conv layer of each checkpoint to accept the extra PET channel.
+        # PET+CT: patch dataset_json so that num_input_channels = 2 (applies to
+        # both early fusion and intermediate fusion).
         self.petct_mode = (modality == 'petct')
         self.first_conv_key = None
         if self.petct_mode:
             dataset_json = dict(dataset_json)
             dataset_json['channel_names'] = {'0': 'CT', '1': 'PET'}
-            print('[petct] Patched dataset_json channel_names for PET+CT early fusion.')
+            print('[petct] Patched dataset_json channel_names for PET+CT.')
 
         configuration_manager = plans_manager.get_configuration(configuration_name, modality=modality)
         # restore network
@@ -228,19 +231,29 @@ class LesionLocatorSegmenter(object):
         if trainer_class is None:
             raise RuntimeError(f'Unable to locate trainer class {trainer_name} in lesionlocator.training.LesionLocatorTrainer. '
                                f'Please place it there (in any .py file)!')
+
+        arch_class_name = configuration_manager.network_arch_class_name
+        arch_init_kwargs = configuration_manager.network_arch_init_kwargs
+        arch_init_kwargs_req_import = configuration_manager.network_arch_init_kwargs_req_import
+        if self.intermediate_fusion_mode:
+            arch_class_name = 'lesionlocator.modules.multimodal_unet.IntermediateFusionResEncUNet'
+            arch_init_kwargs = dict(arch_init_kwargs)
+            arch_init_kwargs['fusion_arch'] = self.fusion_arch
+            print(f'[intermediate-fusion] Using IntermediateFusionResEncUNet with fusion_arch={self.fusion_arch}')
+
         network = trainer_class.build_network_architecture(
-            configuration_manager.network_arch_class_name,
-            configuration_manager.network_arch_init_kwargs,
-            configuration_manager.network_arch_init_kwargs_req_import,
+            arch_class_name,
+            arch_init_kwargs,
+            arch_init_kwargs_req_import,
             num_input_channels,
             plans_manager.get_label_manager(dataset_json).num_segmentation_heads,
             enable_deep_supervision=False
         )
 
-        # PET+CT early fusion: extend first conv from 2 → 3 input channels.
+        # Early fusion: extend first conv from 2 → 3 input channels.
         # This must happen BEFORE load_state_dict so the tensor shapes match.
-        # Skip extension if checkpoint is already at the expected width.
-        if self.petct_mode:
+        # Not needed for intermediate fusion: shared encoder uses 2-channel input.
+        if self.petct_mode and not self.intermediate_fusion_mode:
             self.first_conv_key = self._find_first_conv_key(parameters[0])
             expected_in_ch = num_input_channels + 1  # +1 for prompt channel
             current_in_ch = parameters[0][self.first_conv_key].shape[1]
@@ -257,7 +270,22 @@ class LesionLocatorSegmenter(object):
         self.configuration_manager = configuration_manager
         self.list_of_parameters = parameters
 
-        network.load_state_dict(parameters[0])
+        if self.intermediate_fusion_mode:
+            has_fusion_keys = any(k.startswith('fusion_modules') for k in parameters[0])
+            if has_fusion_keys:
+                network.load_state_dict(parameters[0])
+                print('[intermediate-fusion] Loaded trained intermediate checkpoint (strict).')
+            else:
+                missing, unexpected = network.load_state_dict(parameters[0], strict=False)
+                non_fusion_missing = [k for k in missing if not k.startswith('fusion_modules')]
+                assert not non_fusion_missing, \
+                    f'[intermediate-fusion] Non-fusion keys missing from CT seed: {non_fusion_missing}'
+                assert not unexpected, \
+                    f'[intermediate-fusion] Unexpected keys in CT seed checkpoint: {unexpected}'
+                print(f'[intermediate-fusion] CT seed loaded. '
+                      f'Fusion modules ({len(missing)} keys) retain CT-passthrough init.')
+        else:
+            network.load_state_dict(parameters[0])
 
         self.network = network
         self.dataset_json = dataset_json
@@ -1355,6 +1383,10 @@ def segment_and_track():
     parser.add_argument('--track', action='store_true', required=False, default=False,
                         help='Set this flag to enable tracking. This will use the LesionLocatorTrack model to track lesions.')
     parser.add_argument('--modality', type=str, required=True, choices=['ct', 'pet', 'petct'], default='ct', help="Use this to set the modality. Use 'petct' for early-fusion PET+CT (requires dataset with _0000 CT and _0001 PET files).")
+    parser.add_argument('--fusion_arch', type=str, required=False, default=None,
+                        choices=['tamw', 'mcsa', 'combined'],
+                        help="Intermediate feature-level fusion variant for PET+CT. One of tamw/mcsa/combined. "
+                             "Only used when --modality petct. Omit for early fusion (default behaviour).")
     parser.add_argument('--adaptive_mode', action='store_true', help='Enable selection between segmentation and tracking based on Dice/NSD scores.')
     parser.add_argument('--empty_prompt', action='store_true', help='Set this flag if you want to run the predictor with an empty prompt and will likely lead to worse performance.')
 
@@ -1405,7 +1437,8 @@ def segment_and_track():
     checkpoint_folder = join(args.m, 'LesionLocatorSeg', optimized_ckpt)
     checkpoint_folder_track = join(args.m, 'LesionLocatorTrack')
     # checkpoint_folder_track = join(args.m, 'LesionLocatorSeg')
-    predictor.initialize_from_trained_model_folder(checkpoint_folder, checkpoint_folder_track, args.f, args.modality, "checkpoint_final.pth")
+    predictor.initialize_from_trained_model_folder(checkpoint_folder, checkpoint_folder_track, args.f, args.modality, "checkpoint_final.pth",
+                                                    fusion_arch=getattr(args, 'fusion_arch', None))
     predictor.predict_from_files(args.i, args.o, args.p, args.t,
                                  overwrite=not args.continue_prediction,
                                  num_processes_preprocessing=args.npp,

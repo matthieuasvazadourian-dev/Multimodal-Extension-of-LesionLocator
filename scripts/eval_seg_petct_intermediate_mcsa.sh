@@ -1,0 +1,36 @@
+#!/bin/bash
+set -euo pipefail
+
+source /opt/conda/etc/profile.d/conda.sh
+conda activate lesionlocator
+export PATH="/home/runai-home/.local/bin:$PATH"
+
+SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+cd "$REPO_ROOT"
+python -m pip install -e . --quiet
+
+FOLD=${1:?"Usage: $0 <fold>"}
+
+TEST_DATA=/home/masva/datasets/Dataset901_USZMelanomaPETCT/imagesTr
+TEST_PROMPT=/home/masva/datasets/Dataset901_USZMelanomaPETCT/labelsTr
+CKPT=/home/masva/ckpt/TrainSeg900_Intermediate_MCSA
+OUTPUT=/home/masva/vis_pet_seg_eval_mcsa/fold_$FOLD
+
+mkdir -p "$OUTPUT"
+
+export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:64
+export CUDA_VISIBLE_DEVICES=0
+
+LesionLocator_track \
+  -i  $TEST_DATA \
+  -p  $TEST_PROMPT \
+  -m  $CKPT \
+  -o  $OUTPUT \
+  -f  $FOLD \
+  -t  point \
+  -npp 6 -nps 3 \
+  --modality petct \
+  --fusion_arch mcsa \
+  2>&1 | tee "$OUTPUT/eval_seg_petct_mcsa_fold_$FOLD.txt"
