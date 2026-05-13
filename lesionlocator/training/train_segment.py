@@ -1804,10 +1804,13 @@ class LesionLocatorSegmenter(object):
             # Prefer fold-specific weights when an ensemble of checkpoints has been loaded;
             # fall back to index 0 when only a single pretrained snapshot is available.
             init_idx = fold_idx if fold_idx < len(self.list_of_parameters) else 0
-            if isinstance(self.network, OptimizedModule):
-                self.network._orig_mod.load_state_dict(self.list_of_parameters[init_idx])
+            state_dict_to_load = self.list_of_parameters[init_idx]
+            net = self.network._orig_mod if isinstance(self.network, OptimizedModule) else self.network
+            if getattr(self, 'intermediate_fusion_mode', False):
+                has_fusion_keys = any(k.startswith('fusion_modules') for k in state_dict_to_load)
+                net.load_state_dict(state_dict_to_load, strict=has_fusion_keys)
             else:
-                self.network.load_state_dict(self.list_of_parameters[init_idx])
+                net.load_state_dict(state_dict_to_load)
             
             # Train this fold
             fold_results = self.train_cv_fold(

@@ -83,33 +83,23 @@ class TAMWLiteFusion(nn.Module):
 
     def _init_ct_passthrough(self, C: int):
         with torch.no_grad():
-            # MLP: init all weights to zero, biases to [+inf, ..., +inf, -inf, ..., -inf]
-            # so tanh(bias) -> [1,...,1, -1,...,-1], but we want [+1,...,+1, 0,...,0]
-            # Simpler: init final linear bias so output = [+large, ..., -large]
-            # tanh(+large) ≈ +1 (CT), tanh(-large) ≈ -1 (PET but we flip below)
-            # Actually: gates W in range [-1,1]. F_enh = W * F.
-            # For CT-passthrough we want: CT gate=1, PET gate=0.
-            # tanh can't output exactly 0, but we can init bias to:
-            #   CT channels: +large -> tanh ~ +1
-            #   PET channels: -large -> tanh ~ -1, then F_enh_pet ≈ -skip_pet
-            # This is not zero. Better: init to produce gates ~ [1,...,1, 0,...,0].
-            # Use bias [-inf] approach is problematic; instead init MLP to near-zero
-            # and rely on proj to handle the passthrough.
+            # proj: identity on CT channels (first C of 2C input), zero on PET channels.
+            # This gives near-CT-passthrough at epoch 0:
+            #   output = skip_ct + proj(gates * [skip_ct, skip_pet])
+            #          ≈ skip_ct + proj(tiny * [skip_ct, skip_pet])   (since gates ≈ 0)
+            #          ≈ skip_ct + tiny * skip_ct  ≈  skip_ct
+            # Crucially, proj.weight != 0 so gradients flow from the start.
+            self.proj.weight.zero_()
+            for i in range(C):
+                self.proj.weight[i, i] = 1.0   # identity on CT half only
+            # MLP: small-scale random init (NOT zero) to avoid zero-gradient dead-start.
+            # With zero MLP weights, gates=0 -> F_enh=0 -> proj sees zero input
+            # -> dL/d(proj) = 0 -> dL/d(gates) = 0 -> dL/d(MLP) = 0. Module stuck.
+            # Small std keeps initial output ≈ skip_ct while allowing gradient flow.
             for layer in self.mlp:
                 if isinstance(layer, nn.Linear):
-                    nn.init.zeros_(layer.weight)
+                    nn.init.normal_(layer.weight, mean=0.0, std=0.01)
                     nn.init.zeros_(layer.bias)
-            # With MLP -> all zeros output -> tanh(0) = 0 -> gates = 0
-            # F_enh = 0 * F = all zeros
-            # proj must then produce skip_ct from zeros... that doesn't work.
-            #
-            # Correct approach: don't use gates to achieve passthrough.
-            # Instead: add skip_ct as a residual OUTSIDE the gating.
-            # F_out = skip_ct + proj(gates * concat([skip_ct, skip_pet]))
-            # With gates=0: F_out = skip_ct + proj(0) = skip_ct. Clean passthrough.
-            # This is equivalent to a residual gating formulation.
-            # proj init: zero (since residual carries the signal)
-            self.proj.weight.zero_()
 
     def forward(self, skip_ct: torch.Tensor, skip_pet: torch.Tensor) -> torch.Tensor:
         F_cat = torch.cat([skip_ct, skip_pet], dim=1)           # [B, 2C, D, H, W]
@@ -236,15 +226,16 @@ class BDSABlock(nn.Module):
     def forward(self, x_ct: torch.Tensor, x_pet: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         x_ct, x_pet: [N, C, wd, wh, ww]  (window tokens)
-        Returns enhanced (e_ct, e_pet) of same shape.
+        Returns DELTA tensors (attention output only, no residual).
+        MCSAFusion.forward adds the single outer residual.
         """
         # PET -> CT: CT is target, PET is source
         A_self_ct,  A_cross_ct  = self._attend(source=x_pet, target=x_ct)
-        e_ct  = x_ct  + self.mixer(torch.cat([A_self_ct,  A_cross_ct],  dim=1))
+        e_ct  = self.mixer(torch.cat([A_self_ct,  A_cross_ct],  dim=1))
 
         # CT -> PET: PET is target, CT is source
         A_self_pet, A_cross_pet = self._attend(source=x_ct,  target=x_pet)
-        e_pet = x_pet + self.mixer(torch.cat([A_self_pet, A_cross_pet], dim=1))
+        e_pet = self.mixer(torch.cat([A_self_pet, A_cross_pet], dim=1))
 
         return e_ct, e_pet
 
