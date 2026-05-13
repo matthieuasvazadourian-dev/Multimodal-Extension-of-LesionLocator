@@ -182,8 +182,6 @@ class LesionLocatorSegmenter(object):
         This is used when making predictions with a trained model
         """
         print("Loading segmentation model.")
-        self.intermediate_fusion_mode = (fusion_arch is not None) and (modality == 'petct')
-        self.fusion_arch = fusion_arch
         if use_folds is None:
             use_folds = LesionLocatorSegmenter.auto_detect_available_folds(model_training_output_dir, checkpoint_name)
         dataset_json = load_json(join(model_training_output_dir, 'dataset.json'))
@@ -211,12 +209,23 @@ class LesionLocatorSegmenter(object):
                 configuration_name = checkpoint['init_args']['configuration']
                 inference_allowed_mirroring_axes = checkpoint['inference_allowed_mirroring_axes'] if \
                     'inference_allowed_mirroring_axes' in checkpoint.keys() else None
+                # Auto-detect fusion_arch from checkpoint when not provided via CLI
+                fusion_arch_from_ckpt = checkpoint.get('fusion_arch', None)
+                if fusion_arch is None and fusion_arch_from_ckpt is not None:
+                    fusion_arch = fusion_arch_from_ckpt
+                    print(f'[intermediate-fusion] Auto-detected fusion_arch={fusion_arch} from checkpoint.')
+                elif fusion_arch is not None and fusion_arch_from_ckpt is not None and fusion_arch != fusion_arch_from_ckpt:
+                    raise ValueError(
+                        f'CLI --fusion_arch={fusion_arch} disagrees with checkpoint fusion_arch={fusion_arch_from_ckpt}'
+                    )
 
             parameters.append(checkpoint['network_weights'])
 
         # PET+CT: patch dataset_json so that num_input_channels = 2 (applies to
         # both early fusion and intermediate fusion).
         self.petct_mode = (modality == 'petct')
+        self.intermediate_fusion_mode = (fusion_arch is not None) and (modality == 'petct')
+        self.fusion_arch = fusion_arch
         self.first_conv_key = None
         if self.petct_mode:
             dataset_json = dict(dataset_json)

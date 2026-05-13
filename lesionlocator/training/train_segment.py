@@ -2440,6 +2440,7 @@ class LesionLocatorSegmenter(object):
             'network_weights': net_for_state.state_dict(),
             'optimizer_state': self.optimizer.state_dict(),
             'trainer_name': self.trainer_name,
+            'fusion_arch': getattr(self, 'fusion_arch', None),
         }
         if self.scheduler:
             checkpoint['scheduler_state'] = self.scheduler.state_dict()
@@ -2473,6 +2474,7 @@ class LesionLocatorSegmenter(object):
                     'configuration': config_name,
                 },
                 'inference_allowed_mirroring_axes': getattr(self, 'allowed_mirroring_axes', None),
+                'fusion_arch': getattr(self, 'fusion_arch', None),
             }
             
             inference_checkpoint_path = os.path.join(inference_dir, 'checkpoint_final.pth')
