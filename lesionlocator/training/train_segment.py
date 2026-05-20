@@ -1678,9 +1678,10 @@ class LesionLocatorSegmenter(object):
             w_sum = sum(raw_w)
             weights = [w / w_sum for w in raw_w]
             total_loss = predictions[0].new_zeros(1).squeeze()
+            targets_long = targets.long()
             for k, (pred, w) in enumerate(zip(predictions, weights)):
                 if k == 0:
-                    t = targets
+                    t = targets_long
                 else:
                     # Downsample target to match DS level spatial size using nearest-neighbor
                     t = torch.nn.functional.interpolate(
@@ -2034,6 +2035,16 @@ class LesionLocatorSegmenter(object):
                     best_val_loss = checkpoint.get('best_val_loss', float('inf'))
                     best_test_dice = checkpoint.get('best_test_dice', 0.0)
                     print(f"Resuming training from epoch {start_epoch}, best val loss: {best_val_loss:.4f}")
+                    if start_epoch >= epochs:
+                        print(f"Fold {fold_idx} already complete (epoch {start_epoch - 1}/{epochs - 1}). Skipping.")
+                        return {
+                            'fold_idx': fold_idx,
+                            'train_losses': [best_val_loss],
+                            'val_losses': [best_val_loss],
+                            'test_dice_scores': [best_test_dice] if best_test_dice > 0.0 else [],
+                            'best_val_loss': best_val_loss,
+                            'best_test_dice': best_test_dice,
+                        }
                 except Exception as e:
                     print(f"Error loading checkpoint: {e}")
                     print("Starting fresh training...")
