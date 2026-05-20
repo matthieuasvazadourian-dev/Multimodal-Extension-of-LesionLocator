@@ -260,10 +260,14 @@ class LesionLocatorSegmenter(object):
                     and not (k.startswith('decoder.seg_layers.')
                              and not k.startswith('decoder.seg_layers.0.'))
                 ]
-                assert not non_fusion_missing, \
-                    f'[intermediate-fusion] Non-fusion keys missing from CT seed: {non_fusion_missing}'
-                assert not unexpected, \
-                    f'[intermediate-fusion] Unexpected keys in CT seed checkpoint: {unexpected}'
+                if non_fusion_missing:
+                    raise RuntimeError(
+                        f'[intermediate-fusion] Non-fusion keys missing from CT seed: {non_fusion_missing}'
+                    )
+                if unexpected:
+                    raise RuntimeError(
+                        f'[intermediate-fusion] Unexpected keys in CT seed checkpoint: {unexpected}'
+                    )
                 n_fusion = sum(1 for k in missing if k.startswith('fusion_modules'))
                 n_aux_heads = sum(1 for k in missing
                                   if k.startswith('decoder.seg_layers.')

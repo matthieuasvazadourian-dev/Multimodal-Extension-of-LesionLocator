@@ -676,10 +676,14 @@ class LesionLocatorSegmenter(object):
                         return True
                     return False
                 non_fusion_missing = [k for k in missing if not _is_expected_missing(k)]
-                assert not non_fusion_missing, \
-                    f'[intermediate-fusion] Non-fusion keys missing from CT seed: {non_fusion_missing}'
-                assert not unexpected, \
-                    f'[intermediate-fusion] Unexpected keys in CT seed checkpoint: {unexpected}'
+                if non_fusion_missing:
+                    raise RuntimeError(
+                        f'[intermediate-fusion] Non-fusion keys missing from CT seed: {non_fusion_missing}'
+                    )
+                if unexpected:
+                    raise RuntimeError(
+                        f'[intermediate-fusion] Unexpected keys in CT seed checkpoint: {unexpected}'
+                    )
                 n_fusion = sum(1 for k in missing if k.startswith('fusion_modules'))
                 n_aux_heads = sum(1 for k in missing
                                   if k.startswith('decoder.seg_layers.')
@@ -2058,8 +2062,13 @@ class LesionLocatorSegmenter(object):
                     best_test_dice = checkpoint.get('best_test_dice', 0.0)
                     ckpt_total_epochs = checkpoint.get('total_epochs', None)
                     if ckpt_total_epochs is not None and ckpt_total_epochs != epochs:
-                        print(f"WARNING: checkpoint total_epochs={ckpt_total_epochs} != requested epochs={epochs}. "
-                              f"LR schedule will use the current epochs={epochs} horizon.")
+                        raise RuntimeError(
+                            f"Cannot resume: checkpoint was trained with total_epochs={ckpt_total_epochs} "
+                            f"but --epochs={epochs} was requested. Resuming with a different epoch horizon "
+                            f"produces a discontinuous LR schedule (optimizer param-group lrs stored from the "
+                            f"old schedule). Pass --epochs={ckpt_total_epochs} to resume correctly, or delete "
+                            f"the checkpoint to start fresh with the new horizon."
+                        )
                     print(f"Resuming training from epoch {start_epoch}, best val loss: {best_val_loss:.4f}")
                     if start_epoch >= epochs:
                         print(f"Fold {fold_idx} already complete (epoch {start_epoch - 1}/{epochs - 1}). Skipping.")
