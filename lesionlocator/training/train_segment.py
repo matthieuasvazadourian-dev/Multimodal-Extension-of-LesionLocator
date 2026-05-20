@@ -666,17 +666,24 @@ class LesionLocatorSegmenter(object):
             else:
                 # CT seed checkpoint — non-strict; fusion modules keep CT-passthrough init
                 missing, unexpected = network.load_state_dict(parameters[0], strict=False)
-                non_fusion_missing = [
-                    k for k in missing
-                    if not k.startswith('fusion_modules')
-                    and not k.startswith('decoder.seg_layers.')
-                ]
+                def _is_expected_missing(k: str) -> bool:
+                    if k.startswith('fusion_modules'):
+                        return True
+                    # Aux DS heads (index 1+): in DS=True model, absent in DS=False CT seed.
+                    # decoder.seg_layers.0 (primary head) must be present — do NOT ignore it.
+                    if (k.startswith('decoder.seg_layers.')
+                            and not k.startswith('decoder.seg_layers.0.')):
+                        return True
+                    return False
+                non_fusion_missing = [k for k in missing if not _is_expected_missing(k)]
                 assert not non_fusion_missing, \
                     f'[intermediate-fusion] Non-fusion keys missing from CT seed: {non_fusion_missing}'
                 assert not unexpected, \
                     f'[intermediate-fusion] Unexpected keys in CT seed checkpoint: {unexpected}'
                 n_fusion = sum(1 for k in missing if k.startswith('fusion_modules'))
-                n_aux_heads = sum(1 for k in missing if k.startswith('decoder.seg_layers.'))
+                n_aux_heads = sum(1 for k in missing
+                                  if k.startswith('decoder.seg_layers.')
+                                  and not k.startswith('decoder.seg_layers.0.'))
                 print(f'[intermediate-fusion] CT seed loaded. '
                       f'Fusion modules ({n_fusion} keys) retain CT-passthrough init. '
                       f'DS aux heads ({n_aux_heads} keys) will be trained from scratch.')
@@ -1692,6 +1699,8 @@ class LesionLocatorSegmenter(object):
             total_loss = predictions[0].new_zeros(1).squeeze()
             targets_long = targets.long()
             for k, (pred, w) in enumerate(zip(predictions, weights)):
+                if w == 0.0:
+                    continue  # skip zero-weight heads entirely (avoids 0 * NaN poisoning total_loss)
                 if k == 0:
                     t = targets_long
                 else:
@@ -2050,15 +2059,7 @@ class LesionLocatorSegmenter(object):
                     ckpt_total_epochs = checkpoint.get('total_epochs', None)
                     if ckpt_total_epochs is not None and ckpt_total_epochs != epochs:
                         print(f"WARNING: checkpoint total_epochs={ckpt_total_epochs} != requested epochs={epochs}. "
-                              f"Rebuilding LR scheduler with total_epochs={ckpt_total_epochs} to preserve schedule.")
-                        _te = ckpt_total_epochs
-                        self.scheduler = optim.lr_scheduler.LambdaLR(
-                            self.optimizer,
-                            lr_lambda=lambda e: (1.0 - e / max(_te, 1)) ** 0.9,
-                        )
-                        self._total_epochs = ckpt_total_epochs
-                        if 'scheduler_state' in checkpoint:
-                            self.scheduler.load_state_dict(checkpoint['scheduler_state'])
+                              f"LR schedule will use the current epochs={epochs} horizon.")
                     print(f"Resuming training from epoch {start_epoch}, best val loss: {best_val_loss:.4f}")
                     if start_epoch >= epochs:
                         print(f"Fold {fold_idx} already complete (epoch {start_epoch - 1}/{epochs - 1}). Skipping.")
