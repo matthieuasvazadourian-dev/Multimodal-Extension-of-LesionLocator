@@ -2254,11 +2254,6 @@ class LesionLocatorSegmenter(object):
 
             fold_folder = os.path.join(output_folder, f'fold_{fold_idx}') if output_folder else None
 
-            # Save checkpoint_latest every epoch so resume restores full Adam state
-            if fold_folder:
-                self._save_checkpoint(fold_folder, 'checkpoint_latest.pth', epoch, fold_idx=fold_idx,
-                                      best_val_loss=best_val_loss, best_test_dice=best_test_dice)
-
             # Save best model for this fold (based on validation loss)
             if avg_val_loss < best_val_loss:
                 best_val_loss = avg_val_loss
@@ -2267,6 +2262,12 @@ class LesionLocatorSegmenter(object):
                                           ckpt_path=ckpt_path, prompt_type=prompt_type,
                                           best_val_loss=best_val_loss)
                     print(f"New best model saved for fold {fold_idx} (val_loss: {avg_val_loss:.4f})")
+
+            # Save checkpoint_latest every epoch so resume restores full Adam state.
+            # Saved AFTER best_val_loss update so resumed metadata is always consistent.
+            if fold_folder:
+                self._save_checkpoint(fold_folder, 'checkpoint_latest.pth', epoch, fold_idx=fold_idx,
+                                      best_val_loss=best_val_loss, best_test_dice=best_test_dice)
 
             # Save periodic checkpoint
             if fold_folder and (epoch + 1) % 10 == 0:
@@ -2436,11 +2437,12 @@ class LesionLocatorSegmenter(object):
                             num_val_batches += 1
                             
                             # Process each sample in the batch for dice computation and visualization
+                            logits = outputs[0] if isinstance(outputs, (list, tuple)) else outputs
                             for i in range(data.shape[0]):
                                 filename = os.path.basename(filenames[i]).replace('.nii.gz', '')
-                                
+
                                 # Get predictions (convert to class predictions)
-                                output_single = outputs[i:i+1]  # Keep batch dimension
+                                output_single = logits[i:i+1]  # Keep batch dimension
                                 pred_probs = torch.softmax(output_single, dim=1)
                                 pred_classes = torch.argmax(pred_probs, dim=1).squeeze(0)  # [H, W, D]
                                 

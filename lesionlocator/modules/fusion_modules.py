@@ -270,7 +270,7 @@ class MCSAFusionWrapper(nn.Module):
         self.mcsa = MCSAFusion(C, window_size)
         self.proj = nn.Sequential(
             nn.Conv3d(2 * C, C, kernel_size=1, bias=False),
-            nn.InstanceNorm3d(C, affine=True),
+            nn.GroupNorm(min(32, C), C, affine=True),  # GroupNorm: safe at any spatial size incl. 1×1×1
             nn.LeakyReLU(negative_slope=0.01, inplace=True),
             nn.Conv3d(C, C, kernel_size=1, bias=False),   # zero-init → CT-passthrough
         )
