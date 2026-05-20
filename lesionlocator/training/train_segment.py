@@ -2046,44 +2046,54 @@ class LesionLocatorSegmenter(object):
             resume_path = latest_path if os.path.exists(latest_path) else (best_path if os.path.exists(best_path) else None)
             if resume_path:
                 print(f"Found existing checkpoint: {resume_path}")
+                checkpoint = None
                 try:
                     checkpoint = torch.load(resume_path, map_location='cpu', weights_only=False)
-                    if isinstance(self.network, OptimizedModule):
-                        self.network._orig_mod.load_state_dict(checkpoint['network_weights'])
-                    else:
-                        self.network.load_state_dict(checkpoint['network_weights'])
-                    self.optimizer.load_state_dict(checkpoint['optimizer_state'])
-                    if 'scheduler_state' in checkpoint and self.scheduler is not None:
-                        self.scheduler.load_state_dict(checkpoint['scheduler_state'])
-                    if 'scaler_state' in checkpoint and self.scaler is not None:
-                        self.scaler.load_state_dict(checkpoint['scaler_state'])
-                    start_epoch = checkpoint['epoch'] + 1
-                    best_val_loss = checkpoint.get('best_val_loss', float('inf'))
-                    best_test_dice = checkpoint.get('best_test_dice', 0.0)
+                except Exception as e:
+                    print(f"Error reading checkpoint file: {e}")
+                    print("Starting fresh training...")
+                    start_epoch = 0
+
+                if checkpoint is not None:
+                    # Validate BEFORE mutating any live state — horizon mismatch must not be swallowed.
                     ckpt_total_epochs = checkpoint.get('total_epochs', None)
                     if ckpt_total_epochs is not None and ckpt_total_epochs != epochs:
                         raise RuntimeError(
                             f"Cannot resume: checkpoint was trained with total_epochs={ckpt_total_epochs} "
                             f"but --epochs={epochs} was requested. Resuming with a different epoch horizon "
-                            f"produces a discontinuous LR schedule (optimizer param-group lrs stored from the "
-                            f"old schedule). Pass --epochs={ckpt_total_epochs} to resume correctly, or delete "
-                            f"the checkpoint to start fresh with the new horizon."
+                            f"produces a discontinuous LR schedule. Pass --epochs={ckpt_total_epochs} to "
+                            f"resume correctly, or delete {resume_path} to start fresh with the new horizon."
                         )
-                    print(f"Resuming training from epoch {start_epoch}, best val loss: {best_val_loss:.4f}")
-                    if start_epoch >= epochs:
-                        print(f"Fold {fold_idx} already complete (epoch {start_epoch - 1}/{epochs - 1}). Skipping.")
-                        return {
-                            'fold_idx': fold_idx,
-                            'train_losses': [best_val_loss],
-                            'val_losses': [best_val_loss],
-                            'test_dice_scores': [best_test_dice] if best_test_dice > 0.0 else [],
-                            'best_val_loss': best_val_loss,
-                            'best_test_dice': best_test_dice,
-                        }
-                except Exception as e:
-                    print(f"Error loading checkpoint: {e}")
-                    print("Starting fresh training...")
-                    start_epoch = 0
+                    try:
+                        if isinstance(self.network, OptimizedModule):
+                            self.network._orig_mod.load_state_dict(checkpoint['network_weights'])
+                        else:
+                            self.network.load_state_dict(checkpoint['network_weights'])
+                        self.optimizer.load_state_dict(checkpoint['optimizer_state'])
+                        if 'scheduler_state' in checkpoint and self.scheduler is not None:
+                            self.scheduler.load_state_dict(checkpoint['scheduler_state'])
+                        if 'scaler_state' in checkpoint and self.scaler is not None:
+                            self.scaler.load_state_dict(checkpoint['scaler_state'])
+                        start_epoch = checkpoint['epoch'] + 1
+                        best_val_loss = checkpoint.get('best_val_loss', float('inf'))
+                        best_test_dice = checkpoint.get('best_test_dice', 0.0)
+                        print(f"Resuming training from epoch {start_epoch}, best val loss: {best_val_loss:.4f}")
+                        if start_epoch >= epochs:
+                            print(f"Fold {fold_idx} already complete (epoch {start_epoch - 1}/{epochs - 1}). Skipping.")
+                            return {
+                                'fold_idx': fold_idx,
+                                'train_losses': [best_val_loss],
+                                'val_losses': [best_val_loss],
+                                'test_dice_scores': [best_test_dice] if best_test_dice > 0.0 else [],
+                                'best_val_loss': best_val_loss,
+                                'best_test_dice': best_test_dice,
+                            }
+                    except RuntimeError:
+                        raise
+                    except Exception as e:
+                        print(f"Error loading checkpoint state: {e}")
+                        print("Starting fresh training...")
+                        start_epoch = 0
             else:
                 print("No existing checkpoint found, starting fresh training...")
 
