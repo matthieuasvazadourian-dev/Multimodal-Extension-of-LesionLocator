@@ -102,10 +102,10 @@ class BDSABlock(nn.Module):
     Bidirectional Spatial Attention (BDSA) from H2ASeg (eq. 1).
 
     Given source s and target t (both shape [N, C, ...] where N = num_windows*B):
-      A_self  = V_s  * softmax((Q_t^T K_s) / sqrt(C))^T   <- cross: t queries s
-      A_cross = V_t  * softmax((Q_t^T K_t) / sqrt(C))^T   <- self:  t queries t
+      A_cross = V_s  * softmax((Q_t^T K_s) / sqrt(C))^T   <- cross-attention: t queries s
+      A_self  = V_t  * softmax((Q_t^T K_t) / sqrt(C))^T   <- self-attention:  t queries t
 
-    Enhanced target = 3x3x3_conv(concat([A_self, A_cross]))
+    Enhanced target = 3x3x3_conv(concat([A_cross, A_self]))
 
     Run twice (PET->CT and CT->PET) with shared projections.
 
@@ -127,17 +127,19 @@ class BDSABlock(nn.Module):
     def _attend(self, source: torch.Tensor, target: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         source, target: [N, C, wd, wh, ww]
-        Returns (A_cross, A_self) each of shape [N, C, wd, wh, ww]
-          A_cross = cross-attention: target queries source (target gets source context)
-          A_self  = self-attention:  target queries target
+        Returns (A_cross, A_self) each of shape [N, C, wd, wh, ww]:
+          A_cross = cross-attention: target attends to source (Q_t K_s V_s)
+          A_self  = self-attention:  target attends to itself  (Q_t K_t V_t)
         Projections and attention run in fp32 to avoid softmax overflow under AMP fp16.
         """
         N, C, wd, wh, ww = source.shape
         L = wd * wh * ww
         orig_dtype = source.dtype
 
-        # Force fp32 for numerical stability — cast inputs and disable autocast locally
-        with torch.amp.autocast('cuda', enabled=False):
+        # Force fp32 for numerical stability — cast inputs and disable autocast locally.
+        # Use device-aware autocast so the test suite runs cleanly on CPU.
+        _device = 'cuda' if source.is_cuda else 'cpu'
+        with torch.amp.autocast(_device, enabled=False):
             src_f = source.float()
             tgt_f = target.float()
 
@@ -278,5 +280,7 @@ class MCSAFusionWrapper(nn.Module):
 
     def forward(self, skip_ct: torch.Tensor, skip_pet: torch.Tensor) -> torch.Tensor:
         e_ct, e_pet = self.mcsa(skip_ct, skip_pet)
-        # Residual bypass: e_ct = skip_ct at init (mixer zero), proj(...) = 0 (final conv zero)
-        return e_ct + self.proj(torch.cat([e_ct, e_pet], dim=1))
+        # Residual bypass: e_ct = skip_ct at init (mixer zero), proj(...) = 0 (final conv zero).
+        # Explicit dtype cast guards against fp16/fp32 mismatch at GroupNorm output under AMP.
+        delta = self.proj(torch.cat([e_ct, e_pet], dim=1)).to(e_ct.dtype)
+        return e_ct + delta

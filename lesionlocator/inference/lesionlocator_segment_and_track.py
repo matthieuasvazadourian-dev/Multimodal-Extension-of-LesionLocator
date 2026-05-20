@@ -295,13 +295,20 @@ class LesionLocatorSegmenter(object):
                 print('[intermediate-fusion] Loaded trained intermediate checkpoint (strict).')
             else:
                 missing, unexpected = network.load_state_dict(parameters[0], strict=False)
-                non_fusion_missing = [k for k in missing if not k.startswith('fusion_modules')]
+                non_fusion_missing = [
+                    k for k in missing
+                    if not k.startswith('fusion_modules')
+                    and not k.startswith('decoder.seg_layers.')
+                ]
                 assert not non_fusion_missing, \
                     f'[intermediate-fusion] Non-fusion keys missing from CT seed: {non_fusion_missing}'
                 assert not unexpected, \
                     f'[intermediate-fusion] Unexpected keys in CT seed checkpoint: {unexpected}'
+                n_fusion = sum(1 for k in missing if k.startswith('fusion_modules'))
+                n_aux_heads = sum(1 for k in missing if k.startswith('decoder.seg_layers.'))
                 print(f'[intermediate-fusion] CT seed loaded. '
-                      f'Fusion modules ({len(missing)} keys) retain CT-passthrough init.')
+                      f'Fusion modules ({n_fusion} keys) and DS aux heads ({n_aux_heads} keys) '
+                      f'retain random init.')
         else:
             network.load_state_dict(parameters[0])
 

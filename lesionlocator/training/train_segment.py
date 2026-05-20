@@ -11,7 +11,7 @@ from threading import Thread
 from time import sleep
 from typing import Tuple, Union, List
 
-import numpy as np
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -68,7 +68,8 @@ def dice_loss(pred, target, epsilon=1e-6):
     union = torch.sum(pred_soft, dims) + torch.sum(target_onehot, dims)
     dice = (2. * intersection + epsilon) / (union + epsilon)
     
-    return 1 - dice[1:].mean()  # skip background (class 0), matching nnUNet default
+    C = pred.shape[1]
+    return 1 - (dice[1:].mean() if C > 1 else dice.mean())  # skip background (class 0), matching nnUNet default
 
 
 def _uses_cuda_device(device: torch.device) -> bool:
@@ -665,13 +666,20 @@ class LesionLocatorSegmenter(object):
             else:
                 # CT seed checkpoint — non-strict; fusion modules keep CT-passthrough init
                 missing, unexpected = network.load_state_dict(parameters[0], strict=False)
-                non_fusion_missing = [k for k in missing if not k.startswith('fusion_modules')]
+                non_fusion_missing = [
+                    k for k in missing
+                    if not k.startswith('fusion_modules')
+                    and not k.startswith('decoder.seg_layers.')
+                ]
                 assert not non_fusion_missing, \
                     f'[intermediate-fusion] Non-fusion keys missing from CT seed: {non_fusion_missing}'
                 assert not unexpected, \
                     f'[intermediate-fusion] Unexpected keys in CT seed checkpoint: {unexpected}'
+                n_fusion = sum(1 for k in missing if k.startswith('fusion_modules'))
+                n_aux_heads = sum(1 for k in missing if k.startswith('decoder.seg_layers.'))
                 print(f'[intermediate-fusion] CT seed loaded. '
-                      f'Fusion modules ({len(missing)} keys) retain CT-passthrough init.')
+                      f'Fusion modules ({n_fusion} keys) retain CT-passthrough init. '
+                      f'DS aux heads ({n_aux_heads} keys) will be trained from scratch.')
         else:
             network.load_state_dict(parameters[0])
 
@@ -1563,16 +1571,18 @@ class LesionLocatorSegmenter(object):
                                if p.requires_grad and 'fusion_modules' not in n]
             self.optimizer = optim.Adam(
                 [{'params': backbone_params, 'lr': learning_rate},
-                 {'params': fusion_params,   'lr': learning_rate * 20}],
+                 {'params': fusion_params,   'lr': learning_rate * 5}],
                 weight_decay=weight_decay
             )
-            print(f'[intermediate-fusion] Optimizer: backbone lr={learning_rate}, fusion lr={learning_rate * 20}')
+            print(f'[intermediate-fusion] Optimizer: backbone lr={learning_rate}, fusion lr={learning_rate * 5}')
         else:
             self.optimizer = optim.Adam(trainable_params, lr=learning_rate, weight_decay=weight_decay)
 
         # Setup loss function (CrossEntropy + Dice loss)
         self._ce_loss = nn.CrossEntropyLoss()
         self.loss_function = self._combined_loss
+
+        self._total_epochs = total_epochs  # stored so _save_checkpoint can persist it
 
         # Poly lr schedule (nnUNet default: (1 - e/E)^0.9)
         if use_scheduler:
@@ -1675,6 +1685,8 @@ class LesionLocatorSegmenter(object):
             # nnUNet-style DS weights: 1, 0.5, 0.25, ... normalized to sum=1
             n = len(predictions)
             raw_w = [1.0 / (2 ** k) for k in range(n)]
+            if n > 1:
+                raw_w[-1] = 0.0  # nnUNet convention: deepest aux head excluded
             w_sum = sum(raw_w)
             weights = [w / w_sum for w in raw_w]
             total_loss = predictions[0].new_zeros(1).squeeze()
@@ -1963,7 +1975,8 @@ class LesionLocatorSegmenter(object):
             use_cache=use_cache,
         )
         
-        # Per-fold seed for reproducibility across variants
+        # Per-fold seed for reproducibility across variants.
+        # Augmentation worker streams remain non-deterministic across resumes — by design.
         torch.manual_seed(42 + (fold_idx or 0))
         np.random.seed(42 + (fold_idx or 0))
 
@@ -2034,6 +2047,18 @@ class LesionLocatorSegmenter(object):
                     start_epoch = checkpoint['epoch'] + 1
                     best_val_loss = checkpoint.get('best_val_loss', float('inf'))
                     best_test_dice = checkpoint.get('best_test_dice', 0.0)
+                    ckpt_total_epochs = checkpoint.get('total_epochs', None)
+                    if ckpt_total_epochs is not None and ckpt_total_epochs != epochs:
+                        print(f"WARNING: checkpoint total_epochs={ckpt_total_epochs} != requested epochs={epochs}. "
+                              f"Rebuilding LR scheduler with total_epochs={ckpt_total_epochs} to preserve schedule.")
+                        _te = ckpt_total_epochs
+                        self.scheduler = optim.lr_scheduler.LambdaLR(
+                            self.optimizer,
+                            lr_lambda=lambda e: (1.0 - e / max(_te, 1)) ** 0.9,
+                        )
+                        self._total_epochs = ckpt_total_epochs
+                        if 'scheduler_state' in checkpoint:
+                            self.scheduler.load_state_dict(checkpoint['scheduler_state'])
                     print(f"Resuming training from epoch {start_epoch}, best val loss: {best_val_loss:.4f}")
                     if start_epoch >= epochs:
                         print(f"Fold {fold_idx} already complete (epoch {start_epoch - 1}/{epochs - 1}). Skipping.")
@@ -2532,6 +2557,7 @@ class LesionLocatorSegmenter(object):
             'optimizer_state': self.optimizer.state_dict(),
             'trainer_name': self.trainer_name,
             'fusion_arch': getattr(self, 'fusion_arch', None),
+            'total_epochs': getattr(self, '_total_epochs', None),
         }
         if self.scheduler:
             checkpoint['scheduler_state'] = self.scheduler.state_dict()
