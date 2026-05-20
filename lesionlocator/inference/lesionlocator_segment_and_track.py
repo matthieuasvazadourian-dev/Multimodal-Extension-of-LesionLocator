@@ -211,6 +211,11 @@ class LesionLocatorSegmenter(object):
                     'inference_allowed_mirroring_axes' in checkpoint.keys() else None
                 # Auto-detect fusion_arch from checkpoint when not provided via CLI
                 fusion_arch_from_ckpt = checkpoint.get('fusion_arch', None)
+                if fusion_arch_from_ckpt not in (None, 'weighted', 'mcsa'):
+                    raise ValueError(
+                        f"Checkpoint uses removed fusion_arch='{fusion_arch_from_ckpt}'. "
+                        f"Old TAMW/Combined checkpoints are incompatible with current code. Retrain with --fusion_arch weighted or mcsa."
+                    )
                 if fusion_arch is None and fusion_arch_from_ckpt is not None:
                     fusion_arch = fusion_arch_from_ckpt
                     print(f'[intermediate-fusion] Auto-detected fusion_arch={fusion_arch} from checkpoint.')
@@ -256,8 +261,12 @@ class LesionLocatorSegmenter(object):
             arch_init_kwargs_req_import,
             num_input_channels,
             plans_manager.get_label_manager(dataset_json).num_segmentation_heads,
-            enable_deep_supervision=False
+            enable_deep_supervision=True
         )
+        # Checkpoints are trained with DS=True; disable DS at inference so forward returns
+        # a single tensor (not a list). Must happen AFTER build and BEFORE load_state_dict.
+        if hasattr(network, 'decoder') and hasattr(network.decoder, 'deep_supervision'):
+            network.decoder.deep_supervision = False
 
         # Early fusion: extend first conv from 2 → 3 input channels.
         # This must happen BEFORE load_state_dict so the tensor shapes match.
@@ -376,9 +385,11 @@ class LesionLocatorSegmenter(object):
                 num_input_channels_tracker,
                 plans_manager_tracker.get_label_manager(dataset_json_tracker).num_segmentation_heads,
                 configuration_manager_tracker.patch_size,
-                enable_deep_supervision=False
+                enable_deep_supervision=True
             )
-            
+            if hasattr(network_tracker, 'decoder') and hasattr(network_tracker.decoder, 'deep_supervision'):
+                network_tracker.decoder.deep_supervision = False
+
             if self.petct_mode:
                 tracker_first_conv_key = self._find_first_conv_key(parameters_tracker[0])
                 expected_in_ch_tracker = num_input_channels_tracker + 1
@@ -1393,8 +1404,8 @@ def segment_and_track():
                         help='Set this flag to enable tracking. This will use the LesionLocatorTrack model to track lesions.')
     parser.add_argument('--modality', type=str, required=True, choices=['ct', 'pet', 'petct'], default='ct', help="Use this to set the modality. Use 'petct' for early-fusion PET+CT (requires dataset with _0000 CT and _0001 PET files).")
     parser.add_argument('--fusion_arch', type=str, required=False, default=None,
-                        choices=['tamw', 'mcsa', 'combined'],
-                        help="Intermediate feature-level fusion variant for PET+CT. One of tamw/mcsa/combined. "
+                        choices=['weighted', 'mcsa'],
+                        help="Intermediate feature-level fusion variant for PET+CT. One of weighted/mcsa. "
                              "Only used when --modality petct. Omit for early fusion (default behaviour).")
     parser.add_argument('--adaptive_mode', action='store_true', help='Enable selection between segmentation and tracking based on Dice/NSD scores.')
     parser.add_argument('--empty_prompt', action='store_true', help='Set this flag if you want to run the predictor with an empty prompt and will likely lead to worse performance.')

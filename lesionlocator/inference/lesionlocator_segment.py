@@ -172,6 +172,11 @@ class LesionLocatorSegmenter(object):
                     'inference_allowed_mirroring_axes' in checkpoint.keys() else None
                 # Auto-detect fusion_arch from checkpoint when not provided via CLI
                 fusion_arch_from_ckpt = checkpoint.get('fusion_arch', None)
+                if fusion_arch_from_ckpt not in (None, 'weighted', 'mcsa'):
+                    raise ValueError(
+                        f"Checkpoint uses removed fusion_arch='{fusion_arch_from_ckpt}'. "
+                        f"Old TAMW/Combined checkpoints are incompatible with current code. Retrain with --fusion_arch weighted or mcsa."
+                    )
                 if fusion_arch is None and fusion_arch_from_ckpt is not None:
                     fusion_arch = fusion_arch_from_ckpt
                     print(f'[intermediate-fusion] Auto-detected fusion_arch={fusion_arch} from checkpoint.')
@@ -216,8 +221,12 @@ class LesionLocatorSegmenter(object):
             arch_init_kwargs_req_import,
             num_input_channels,
             plans_manager.get_label_manager(dataset_json).num_segmentation_heads,
-            enable_deep_supervision=False
+            enable_deep_supervision=True
         )
+        # Checkpoints are trained with DS=True; disable DS at inference so forward returns
+        # a single tensor (not a list). Must happen AFTER build and BEFORE load_state_dict.
+        if hasattr(network, 'decoder') and hasattr(network.decoder, 'deep_supervision'):
+            network.decoder.deep_supervision = False
 
         # PET+CT early fusion: extend first conv from 2 -> 3 input channels.
         # Not needed for intermediate fusion: shared encoder uses 2-channel input.
@@ -812,8 +821,8 @@ def predict_seg_from_prompt():
 
     parser.add_argument('--modality', type=str, required=True, choices=['ct', 'pet', 'petct'], default='ct', help="Use this to set the modality")
     parser.add_argument('--fusion_arch', type=str, required=False, default=None,
-                        choices=['tamw', 'mcsa', 'combined'],
-                        help="Intermediate feature-level fusion variant for PET+CT. One of tamw/mcsa/combined. "
+                        choices=['weighted', 'mcsa'],
+                        help="Intermediate feature-level fusion variant for PET+CT. One of weighted/mcsa. "
                              "Only used when --modality petct. Omit for early fusion (default behaviour).")
     print(
         "\n#######################################################################\nPlease cite the following paper "
