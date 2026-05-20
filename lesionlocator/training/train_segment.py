@@ -68,7 +68,7 @@ def dice_loss(pred, target, epsilon=1e-6):
     union = torch.sum(pred_soft, dims) + torch.sum(target_onehot, dims)
     dice = (2. * intersection + epsilon) / (union + epsilon)
     
-    return 1 - dice.mean()
+    return 1 - dice[1:].mean()  # skip background (class 0), matching nnUNet default
 
 
 def _uses_cuda_device(device: torch.device) -> bool:
@@ -622,7 +622,7 @@ class LesionLocatorSegmenter(object):
             arch_init_kwargs_req_import,
             num_input_channels,
             plans_manager.get_label_manager(dataset_json).num_segmentation_heads,
-            enable_deep_supervision=False
+            enable_deep_supervision=True
         )
 
         # Store configuration name and modality for checkpoint saving and dataset creation
@@ -760,7 +760,7 @@ class LesionLocatorSegmenter(object):
                 num_input_channels_tracker,
                 plans_manager_tracker.get_label_manager(dataset_json_tracker).num_segmentation_heads,
                 configuration_manager_tracker.patch_size,
-                enable_deep_supervision=False
+                enable_deep_supervision=True
             )
 
             if self.petct_mode:
@@ -1465,7 +1465,7 @@ class LesionLocatorSegmenter(object):
         return predicted_logits
 
 
-    def setup_training(self, learning_rate=1e-4, weight_decay=1e-5, use_scheduler=True, finetune_mode='all'):
+    def setup_training(self, learning_rate=1e-4, weight_decay=1e-5, use_scheduler=True, finetune_mode='all', total_epochs=50):
         """
         Setup training components: optimizer, loss function, and scheduler.
         
@@ -1552,25 +1552,33 @@ class LesionLocatorSegmenter(object):
                 "The current implementation only supports '--finetune first_conv' together with "
                 "'--modality petct', where the widened first convolution is re-enabled."
             )
-        
-        # Setup optimizer with only trainable parameters
-        self.optimizer = optim.Adam(
-            trainable_params,
-            lr=learning_rate,
-            weight_decay=weight_decay
-        )
-        
+        self.trainable_params = trainable_params  # stored for grad clipping
+
+        # Setup optimizer: intermediate fusion uses a separate higher lr for fusion modules
+        # so α_pet (init 0) has enough signal to move away from zero.
+        if getattr(self, 'intermediate_fusion_mode', False):
+            fusion_params   = [p for n, p in self.network.named_parameters()
+                               if p.requires_grad and 'fusion_modules' in n]
+            backbone_params = [p for n, p in self.network.named_parameters()
+                               if p.requires_grad and 'fusion_modules' not in n]
+            self.optimizer = optim.Adam(
+                [{'params': backbone_params, 'lr': learning_rate},
+                 {'params': fusion_params,   'lr': learning_rate * 20}],
+                weight_decay=weight_decay
+            )
+            print(f'[intermediate-fusion] Optimizer: backbone lr={learning_rate}, fusion lr={learning_rate * 20}')
+        else:
+            self.optimizer = optim.Adam(trainable_params, lr=learning_rate, weight_decay=weight_decay)
+
         # Setup loss function (CrossEntropy + Dice loss)
         self._ce_loss = nn.CrossEntropyLoss()
         self.loss_function = self._combined_loss
-        
-        # Setup learning rate scheduler
+
+        # Poly lr schedule (nnUNet default: (1 - e/E)^0.9)
         if use_scheduler:
-            self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            self.scheduler = optim.lr_scheduler.LambdaLR(
                 self.optimizer,
-                mode='min',
-                factor=0.5,
-                patience=10
+                lr_lambda=lambda epoch: (1.0 - epoch / max(total_epochs, 1)) ** 0.9
             )
         else:
             self.scheduler = None
@@ -1662,7 +1670,26 @@ class LesionLocatorSegmenter(object):
         print(f"{trainable_label}: {trainable_params:,} / {total_params:,} ({100*trainable_params/total_params:.1f}%)")
 
     def _combined_loss(self, predictions, targets):
-        """Combined CrossEntropy + Dice loss for segmentation training."""
+        """Combined CrossEntropy + Dice loss. Handles deep supervision (list of predictions)."""
+        if isinstance(predictions, (list, tuple)):
+            # nnUNet-style DS weights: 1, 0.5, 0.25, ... normalized to sum=1
+            n = len(predictions)
+            raw_w = [1.0 / (2 ** k) for k in range(n)]
+            w_sum = sum(raw_w)
+            weights = [w / w_sum for w in raw_w]
+            total_loss = predictions[0].new_zeros(1).squeeze()
+            for k, (pred, w) in enumerate(zip(predictions, weights)):
+                if k == 0:
+                    t = targets
+                else:
+                    # Downsample target to match DS level spatial size using nearest-neighbor
+                    t = torch.nn.functional.interpolate(
+                        targets.float().unsqueeze(1),
+                        size=pred.shape[2:],
+                        mode='nearest',
+                    ).squeeze(1).long()
+                total_loss = total_loss + w * (self._ce_loss(pred, t) + dice_loss(pred, t))
+            return total_loss
         ce_loss = self._ce_loss(predictions, targets.long())
         dice_loss_val = dice_loss(predictions, targets)
         return ce_loss + dice_loss_val
@@ -1751,6 +1778,21 @@ class LesionLocatorSegmenter(object):
         save_path = os.path.join(epoch_folder, f'{filename}_axial_{max_axial_slice}_coronal_{max_coronal_slice}.png')
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
         plt.close()
+
+    def _log_fusion_module_stats(self):
+        """Log per-level fusion module diagnostics (α-values for Weighted, mixer norms for MCSA)."""
+        net = self.network._orig_mod if isinstance(self.network, OptimizedModule) else self.network
+        if not hasattr(net, 'fusion_modules'):
+            return
+        for k, m in enumerate(net.fusion_modules):
+            if hasattr(m, 'alpha_ct'):
+                a_ct  = m.alpha_ct.detach().float().mean().item()
+                a_pet = m.alpha_pet.detach().float()
+                print(f'  [fusion] L{k}: α_ct={a_ct:.4f}  α_pet.mean={a_pet.mean().item():.4f}  α_pet.absmax={a_pet.abs().max().item():.4f}')
+            elif hasattr(m, 'mcsa'):
+                inter_norm = m.mcsa.inter_bdsa.mixer.weight.detach().float().norm().item()
+                intra_norm = m.mcsa.intra_bdsa.mixer.weight.detach().float().norm().item()
+                print(f'  [fusion] L{k}: mixer_inter_norm={inter_norm:.4f}  mixer_intra_norm={intra_norm:.4f}')
 
     def train_cross_validation(self, train_input_files, train_prompt_files, train_output_files,
                               test_dataset=None, epochs=10, batch_size=2, lr=1e-4,
@@ -1920,10 +1962,14 @@ class LesionLocatorSegmenter(object):
             use_cache=use_cache,
         )
         
+        # Per-fold seed for reproducibility across variants
+        torch.manual_seed(42 + (fold_idx or 0))
+        np.random.seed(42 + (fold_idx or 0))
+
         # Setup training components
-        self.setup_training(learning_rate=lr, finetune_mode=finetune_mode)
+        self.setup_training(learning_rate=lr, finetune_mode=finetune_mode, total_epochs=epochs)
         self.network.to(device)
-        
+
         # The IterableDataset starts its own preprocessing workers via
         # preprocessing_iterator_fromfiles. PyTorch DataLoader workers are daemonic,
         # so they cannot safely start that inner multiprocessing pipeline.
@@ -1955,23 +2001,26 @@ class LesionLocatorSegmenter(object):
         fold_val_losses = []
         fold_test_dice_scores = []
         best_val_loss = float('inf')
+        best_test_dice = 0.0
 
         print(f"Fold {fold_idx} - Training samples: {len(fold_data['train']['input_files'])}, Prompt samples: {len(fold_data['train']['prompt_files'])}")
         print(f"Fold {fold_idx} - Validation samples: {len(fold_data['val']['input_files'])}, Prompt samples: {len(fold_data['val']['prompt_files'])}")
         if test_dataset is not None:
             print(f"Test samples: {len(test_dataset.input_files)}")
 
-        # Resume from previous best_model.pth if present.
-        # Why: long fold runs get killed; without this they restart at epoch 0
-        # and discard hours of compute even though best_model.pth is on disk.
+        # Resume from checkpoint_latest.pth (preferred) or best_model.pth.
+        # checkpoint_latest survives preemption with full optimizer state intact so
+        # Adam momentum is not discarded on restart.
         start_epoch = 0
         if output_folder and fold_idx is not None:
             fold_folder = os.path.join(output_folder, f'fold_{fold_idx}')
-            checkpoint_path = os.path.join(fold_folder, 'best_model.pth')
-            if os.path.exists(checkpoint_path):
-                print(f"Found existing checkpoint: {checkpoint_path}")
+            latest_path = os.path.join(fold_folder, 'checkpoint_latest.pth')
+            best_path   = os.path.join(fold_folder, 'best_model.pth')
+            resume_path = latest_path if os.path.exists(latest_path) else (best_path if os.path.exists(best_path) else None)
+            if resume_path:
+                print(f"Found existing checkpoint: {resume_path}")
                 try:
-                    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+                    checkpoint = torch.load(resume_path, map_location='cpu', weights_only=False)
                     if isinstance(self.network, OptimizedModule):
                         self.network._orig_mod.load_state_dict(checkpoint['network_weights'])
                     else:
@@ -1979,8 +2028,11 @@ class LesionLocatorSegmenter(object):
                     self.optimizer.load_state_dict(checkpoint['optimizer_state'])
                     if 'scheduler_state' in checkpoint and self.scheduler is not None:
                         self.scheduler.load_state_dict(checkpoint['scheduler_state'])
+                    if 'scaler_state' in checkpoint and self.scaler is not None:
+                        self.scaler.load_state_dict(checkpoint['scaler_state'])
                     start_epoch = checkpoint['epoch'] + 1
                     best_val_loss = checkpoint.get('best_val_loss', float('inf'))
+                    best_test_dice = checkpoint.get('best_test_dice', 0.0)
                     print(f"Resuming training from epoch {start_epoch}, best val loss: {best_val_loss:.4f}")
                 except Exception as e:
                     print(f"Error loading checkpoint: {e}")
@@ -2027,6 +2079,11 @@ class LesionLocatorSegmenter(object):
                         loss = self.loss_function(outputs, target)
 
                     self.scaler.scale(loss).backward()
+                    self.scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(
+                        [p for group in self.optimizer.param_groups for p in group['params']],
+                        max_norm=12.0
+                    )
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
 
@@ -2140,10 +2197,13 @@ class LesionLocatorSegmenter(object):
                             with _autocast_context(device):
                                 outputs = self.network(combined_input)
 
+                            # Deep supervision returns a list; use full-resolution head for eval
+                            logits = outputs[0] if isinstance(outputs, (list, tuple)) else outputs
+
                             for i in range(data.shape[0]):
                                 filename = os.path.basename(filenames[i]).replace('.nii.gz', '')
 
-                                output_single = outputs[i:i+1]
+                                output_single = logits[i:i+1]
                                 pred_probs = torch.softmax(output_single, dim=1)
                                 pred_classes = torch.argmax(pred_probs, dim=1).squeeze(0)
 
@@ -2175,24 +2235,41 @@ class LesionLocatorSegmenter(object):
                 avg_test_dice = np.mean(epoch_test_dice_scores) if epoch_test_dice_scores else 0.0
                 fold_test_dice_scores.append(avg_test_dice)
                 print(f"Test Dice Score: {avg_test_dice:.4f}")
+                # Save diagnostic best-by-Dice checkpoint (not used for eval, just for analysis)
+                if avg_test_dice > best_test_dice:
+                    best_test_dice = avg_test_dice
+                    if output_folder:
+                        _fd = os.path.join(output_folder, f'fold_{fold_idx}')
+                        self._save_checkpoint(_fd, 'best_dice_model.pth', epoch, fold_idx=fold_idx,
+                                              best_val_loss=best_val_loss, best_test_dice=best_test_dice)
+                        print(f"New best-Dice model saved (dice={avg_test_dice:.4f})")
 
             # Update learning rate scheduler
             if self.scheduler:
-                self.scheduler.step(avg_val_loss)
+                self.scheduler.step()
+
+            # Log fusion module stats (α-values / mixer norms) every epoch
+            if getattr(self, 'intermediate_fusion_mode', False):
+                self._log_fusion_module_stats()
+
+            fold_folder = os.path.join(output_folder, f'fold_{fold_idx}') if output_folder else None
+
+            # Save checkpoint_latest every epoch so resume restores full Adam state
+            if fold_folder:
+                self._save_checkpoint(fold_folder, 'checkpoint_latest.pth', epoch, fold_idx=fold_idx,
+                                      best_val_loss=best_val_loss, best_test_dice=best_test_dice)
 
             # Save best model for this fold (based on validation loss)
             if avg_val_loss < best_val_loss:
                 best_val_loss = avg_val_loss
-                if output_folder:
-                    fold_folder = os.path.join(output_folder, f'fold_{fold_idx}')
+                if fold_folder:
                     self._save_checkpoint(fold_folder, 'best_model.pth', epoch, fold_idx=fold_idx,
-                                        ckpt_path=ckpt_path, prompt_type=prompt_type,
-                                        best_val_loss=best_val_loss)
+                                          ckpt_path=ckpt_path, prompt_type=prompt_type,
+                                          best_val_loss=best_val_loss)
                     print(f"New best model saved for fold {fold_idx} (val_loss: {avg_val_loss:.4f})")
 
             # Save periodic checkpoint
-            if output_folder and (epoch + 1) % 10 == 0:
-                fold_folder = os.path.join(output_folder, f'fold_{fold_idx}')
+            if fold_folder and (epoch + 1) % 10 == 0:
                 self._save_checkpoint(fold_folder, f'checkpoint_epoch_{epoch+1}.pth', epoch, fold_idx=fold_idx)
         
         # Save final checkpoint for this fold
@@ -2205,10 +2282,11 @@ class LesionLocatorSegmenter(object):
             'train_losses': fold_train_losses,
             'val_losses': fold_val_losses,
             'test_dice_scores': fold_test_dice_scores,
-            'best_val_loss': best_val_loss
+            'best_val_loss': best_val_loss,
+            'best_test_dice': best_test_dice,
         }
 
-    def train(self, train_dataset, val_dataset=None, epochs=10, batch_size=2, lr=1e-4, 
+    def train(self, train_dataset, val_dataset=None, epochs=10, batch_size=2, lr=1e-4,
               device=None, output_folder=None, num_workers=0, ckpt_path=None, prompt_type='point',
               finetune_mode='all'):
         """
@@ -2431,7 +2509,7 @@ class LesionLocatorSegmenter(object):
         }
 
     def _save_checkpoint(self, output_folder, filename, epoch, fold_idx=None, ckpt_path=None,
-                         prompt_type='point', best_val_loss=None):
+                         prompt_type='point', best_val_loss=None, best_test_dice=None):
         """Save model checkpoint and optionally save inference-compatible checkpoint."""
         os.makedirs(output_folder, exist_ok=True)
         net_for_state = self.network._orig_mod if isinstance(self.network, OptimizedModule) else self.network
@@ -2444,8 +2522,12 @@ class LesionLocatorSegmenter(object):
         }
         if self.scheduler:
             checkpoint['scheduler_state'] = self.scheduler.state_dict()
+        if self.scaler is not None:
+            checkpoint['scaler_state'] = self.scaler.state_dict()
         if best_val_loss is not None:
             checkpoint['best_val_loss'] = best_val_loss
+        if best_test_dice is not None:
+            checkpoint['best_test_dice'] = best_test_dice
 
         checkpoint_path = os.path.join(output_folder, filename)
         torch.save(checkpoint, checkpoint_path)
@@ -2588,8 +2670,8 @@ def train_from_prompt():
                         help='Set this flag to enable tracking. This will use the LesionLocatorTrack model to track lesions.')
     parser.add_argument('--modality', type=str, required=True, choices=['ct', 'pet', 'petct'], default='ct', help="Use this to set the modality. Use 'petct' for early-fusion PET+CT (requires Dataset900/901 with _0000 CT and _0001 PET files).")
     parser.add_argument('--fusion_arch', type=str, required=False, default=None,
-                        choices=['tamw', 'mcsa', 'combined'],
-                        help="Intermediate feature-level fusion variant for PET+CT. One of tamw/mcsa/combined. "
+                        choices=['weighted', 'mcsa'],
+                        help="Intermediate feature-level fusion variant for PET+CT. One of weighted/mcsa. "
                              "Only used when --modality petct. Omit for early fusion (default behaviour).")
     parser.add_argument('--adaptive_mode', action='store_true', help='Enable selection between segmentation and tracking based on Dice/NSD scores.')
     

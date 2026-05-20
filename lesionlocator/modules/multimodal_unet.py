@@ -15,6 +15,9 @@ CT-pretrained 2-channel stem loads with zero weight surgery.
 Weight loading:
   - CT seed (TrainSeg800): strict=False — fusion keys will be in missing_keys
   - Trained intermediate ckpt: strict=True
+
+Fusion variants: 'weighted' (WeightedSkipFusion, ~2C params/level) or
+                 'mcsa' (MCSAFusionWrapper, windowed bidirectional cross-attention).
 """
 
 from typing import List, Union, Tuple
@@ -25,15 +28,16 @@ import torch.nn as nn
 from dynamic_network_architectures.architectures.unet import ResidualEncoderUNet
 
 from lesionlocator.modules.fusion_modules import (
-    SimpleConcatFusion,
-    TAMWLiteFusion,
+    WeightedSkipFusion,
     MCSAFusionWrapper,
-    CombinedFusion,
 )
 
 # Minimum encoder level index at which MCSA is applied.
-# Below this threshold, SimpleConcatFusion is used to save memory.
-_MCSA_MIN_LEVEL = 3
+# Levels 0-1 (full/half res) have inter-window token counts of ~150K / ~19K
+# — the O(L²) attention matrix would be ~90 GB / ~1.4 GB at batch_size=1.
+# Level 2 (~2352 tokens, ~22 MB) is feasible and captures mid-level features
+# where cross-modal fusion is most informative.
+_MCSA_MIN_LEVEL = 2
 _DEFAULT_WINDOW_SIZE = (4, 4, 4)
 
 
@@ -49,7 +53,7 @@ class IntermediateFusionResEncUNet(ResidualEncoderUNet):
     num_classes : int
         Number of segmentation output classes.
     fusion_arch : str
-        One of {'tamw', 'mcsa', 'combined'}.
+        One of {'weighted', 'mcsa'}.
     **kwargs
         All other ResidualEncoderUNet constructor kwargs (conv_op, norm_op, etc.)
         forwarded unchanged to the backbone.
@@ -59,15 +63,15 @@ class IntermediateFusionResEncUNet(ResidualEncoderUNet):
         self,
         input_channels: int,
         num_classes: int,
-        fusion_arch: str = 'tamw',
+        fusion_arch: str = 'weighted',
         **kwargs,
     ):
         assert input_channels == 3, (
             f"IntermediateFusionResEncUNet expects input_channels=3 "
             f"(CT + PET + prompt), got {input_channels}"
         )
-        assert fusion_arch in ('tamw', 'mcsa', 'combined'), (
-            f"fusion_arch must be one of tamw/mcsa/combined, got {fusion_arch}"
+        assert fusion_arch in ('weighted', 'mcsa'), (
+            f"fusion_arch must be one of weighted/mcsa, got {fusion_arch}"
         )
 
         # Build backbone with 2-channel stem (matches CT-pretrained checkpoint)
@@ -91,16 +95,12 @@ class IntermediateFusionResEncUNet(ResidualEncoderUNet):
         )
 
     def _make_fusion_module(self, fusion_arch: str, channels: int, level: int) -> nn.Module:
-        if fusion_arch == 'tamw':
-            return TAMWLiteFusion(channels)
+        if fusion_arch == 'weighted':
+            return WeightedSkipFusion(channels)
         elif fusion_arch == 'mcsa':
             if level < _MCSA_MIN_LEVEL:
-                return SimpleConcatFusion(channels)
+                return WeightedSkipFusion(channels)
             return MCSAFusionWrapper(channels, _DEFAULT_WINDOW_SIZE)
-        elif fusion_arch == 'combined':
-            if level < _MCSA_MIN_LEVEL:
-                return SimpleConcatFusion(channels)
-            return CombinedFusion(channels, _DEFAULT_WINDOW_SIZE)
         else:
             raise ValueError(f"Unknown fusion_arch: {fusion_arch}")
 

@@ -1,17 +1,13 @@
 """
 Intermediate feature-level fusion modules for PET+CT segmentation.
 
-Three variants:
-  - TAMWLiteFusion  (Variant A): channel-gated affine weighting, no decoder dependency
-  - MCSAFusion      (Variant B): windowed bidirectional cross-attention (BDSA)
-  - CombinedFusion  (Variant C): MCSA -> TAMWLite in sequence
+Two variants:
+  - WeightedSkipFusion (Variant A): learnt per-channel affine weighting, ~2C params/level
+  - MCSAFusion         (Variant B): windowed bidirectional cross-attention (BDSA)
 
-All modules are designed to:
-  - Accept (skip_ct, skip_pet) tensors of shape [B, C, D, H, W]
-  - Output a fused tensor of the same C channels (decoder-compatible)
-  - Init to CT-passthrough so model == CT-only at epoch 0
-
-SimpleConcatFusion is used at shallow encoder levels (k < 3) where MCSA is too expensive.
+All modules accept (skip_ct, skip_pet) tensors of shape [B, C, D, H, W] and output a
+fused tensor of the same C channels (decoder-compatible). All init to CT-passthrough so
+model == CT-only at epoch 0.
 """
 
 import torch
@@ -21,94 +17,28 @@ from typing import Tuple
 
 
 # ---------------------------------------------------------------------------
-# Utility: Simple concat + 1x1 projection (shallow levels / fallback)
+# Variant A: WeightedSkipFusion — learnt per-channel affine weighting
 # ---------------------------------------------------------------------------
 
-class SimpleConcatFusion(nn.Module):
-    """Concat CT and PET skips, project back to C channels. CT-passthrough init."""
-
-    def __init__(self, in_channels: int):
-        super().__init__()
-        self.proj = nn.Conv3d(2 * in_channels, in_channels, kernel_size=1, bias=False)
-        self._init_ct_passthrough(in_channels)
-
-    def _init_ct_passthrough(self, C: int):
-        # Weight shape: [C_out, 2*C_in, 1, 1, 1]
-        # First C_in input channels = CT, last C_in = PET
-        # Init: identity on CT channels, zero on PET channels
-        with torch.no_grad():
-            self.proj.weight.zero_()
-            for i in range(C):
-                self.proj.weight[i, i] = 1.0
-
-    def forward(self, skip_ct: torch.Tensor, skip_pet: torch.Tensor) -> torch.Tensor:
-        return self.proj(torch.cat([skip_ct, skip_pet], dim=1))
-
-
-# ---------------------------------------------------------------------------
-# Variant A: TAMW-lite (channel-gating without prediction maps)
-# ---------------------------------------------------------------------------
-
-class TAMWLiteFusion(nn.Module):
+class WeightedSkipFusion(nn.Module):
     """
-    Channel-wise affine gating of concatenated [CT, PET] skip features.
+    Learnt per-channel affine weighting of CT and PET skip features.
 
-    Procedure (per H2ASeg TAMW spirit, no decoder prediction maps):
-      1. concat [s_ct, s_pet] -> F in R^{B x 2C x D x H x W}
-      2. global average pool -> R^{B x 2C}
-      3. MLP + tanh -> gates W in R^{B x 2C}  (range [-1, 1])
-      4. F_enh = W * F  (per-channel rescaling, broadcast)
-      5. 1x1x1 conv: 2C -> C  (CT-passthrough init)
+      output = alpha_ct * skip_ct + alpha_pet * skip_pet
 
-    CT-passthrough init: MLP bias = 0 -> tanh(0) = 0 -> gates = 0
-    -> F_enh = 0 * F = 0, then proj reproduces CT channels from identity.
-    To achieve epoch-0 CT-only behaviour:
-      - gates initialized to [1 ... 1, 0 ... 0] (CT channels=1, PET channels=0)
-      - proj initialized to identity on concatenated input (only CT half matters)
+    alpha_ct, alpha_pet are C-dim learned vectors — ~2C params per level.
+    CT-passthrough init: alpha_ct = 1, alpha_pet = 0 -> output = skip_ct at epoch 0.
     """
 
     def __init__(self, in_channels: int):
         super().__init__()
-        C = in_channels
-        self.gap = nn.AdaptiveAvgPool3d(1)
-        # MLP: 2C -> 4C -> 2C, tanh activation
-        self.mlp = nn.Sequential(
-            nn.Linear(2 * C, 4 * C, bias=True),
-            nn.ReLU(inplace=True),
-            nn.Linear(4 * C, 2 * C, bias=True),
-            nn.Tanh(),
-        )
-        self.proj = nn.Conv3d(2 * C, C, kernel_size=1, bias=False)
-        self._init_ct_passthrough(C)
-
-    def _init_ct_passthrough(self, C: int):
-        with torch.no_grad():
-            # proj: identity on CT channels (first C of 2C input), zero on PET channels.
-            # This gives near-CT-passthrough at epoch 0:
-            #   output = skip_ct + proj(gates * [skip_ct, skip_pet])
-            #          ≈ skip_ct + proj(tiny * [skip_ct, skip_pet])   (since gates ≈ 0)
-            #          ≈ skip_ct + tiny * skip_ct  ≈  skip_ct
-            # Crucially, proj.weight != 0 so gradients flow from the start.
-            self.proj.weight.zero_()
-            for i in range(C):
-                self.proj.weight[i, i] = 1.0   # identity on CT half only
-            # MLP: small-scale random init (NOT zero) to avoid zero-gradient dead-start.
-            # With zero MLP weights, gates=0 -> F_enh=0 -> proj sees zero input
-            # -> dL/d(proj) = 0 -> dL/d(gates) = 0 -> dL/d(MLP) = 0. Module stuck.
-            # Small std keeps initial output ≈ skip_ct while allowing gradient flow.
-            for layer in self.mlp:
-                if isinstance(layer, nn.Linear):
-                    nn.init.normal_(layer.weight, mean=0.0, std=0.01)
-                    nn.init.zeros_(layer.bias)
+        self.alpha_ct  = nn.Parameter(torch.ones(in_channels))
+        self.alpha_pet = nn.Parameter(torch.zeros(in_channels))
 
     def forward(self, skip_ct: torch.Tensor, skip_pet: torch.Tensor) -> torch.Tensor:
-        F_cat = torch.cat([skip_ct, skip_pet], dim=1)           # [B, 2C, D, H, W]
-        gap = self.gap(F_cat).flatten(1)                         # [B, 2C]
-        gates = self.mlp(gap)                                    # [B, 2C]  in [-1,1]
-        gates = gates.view(*gates.shape, 1, 1, 1)               # [B, 2C, 1, 1, 1]
-        F_enh = gates * F_cat                                    # [B, 2C, D, H, W]
-        # Residual: skip_ct + learned modulation
-        return skip_ct + self.proj(F_enh)                        # [B, C, D, H, W]
+        a = self.alpha_ct.view(1, -1, 1, 1, 1)
+        b = self.alpha_pet.view(1, -1, 1, 1, 1)
+        return a * skip_ct + b * skip_pet
 
 
 # ---------------------------------------------------------------------------
@@ -197,31 +127,39 @@ class BDSABlock(nn.Module):
     def _attend(self, source: torch.Tensor, target: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         source, target: [N, C, wd, wh, ww]
-        Returns (A_self, A_cross) each of shape [N, C, wd, wh, ww]
-          A_self  = cross-attention: target queries source (target gets source context)
-          A_cross = self-attention: target queries target
+        Returns (A_cross, A_self) each of shape [N, C, wd, wh, ww]
+          A_cross = cross-attention: target queries source (target gets source context)
+          A_self  = self-attention:  target queries target
+        Projections and attention run in fp32 to avoid softmax overflow under AMP fp16.
         """
         N, C, wd, wh, ww = source.shape
         L = wd * wh * ww
+        orig_dtype = source.dtype
 
-        Q_t = self.proj_q(target).view(N, C, L)   # [N, C, L]
-        K_s = self.proj_k(source).view(N, C, L)   # [N, C, L]
-        V_s = self.proj_v(source).view(N, C, L)
+        # Force fp32 for numerical stability — cast inputs and disable autocast locally
+        with torch.amp.autocast('cuda', enabled=False):
+            src_f = source.float()
+            tgt_f = target.float()
 
-        K_t = self.proj_k(target).view(N, C, L)
-        V_t = self.proj_v(target).view(N, C, L)
+            Q_t = self.proj_q(tgt_f).view(N, C, L)    # [N, C, L]
+            K_s = self.proj_k(src_f).view(N, C, L)    # [N, C, L]
+            V_s = self.proj_v(src_f).view(N, C, L)
 
-        # Attention weights [N, L, L]
-        attn_cross = torch.bmm(Q_t.transpose(1, 2), K_s) * self.scale   # [N, L, L]
-        attn_cross = attn_cross.softmax(dim=-1)
-        attn_self  = torch.bmm(Q_t.transpose(1, 2), K_t) * self.scale
-        attn_self  = attn_self.softmax(dim=-1)
+            K_t = self.proj_k(tgt_f).view(N, C, L)
+            V_t = self.proj_v(tgt_f).view(N, C, L)
 
-        # A_self: target attends to source values
-        A_self  = torch.bmm(V_s, attn_cross.transpose(1, 2)).view(N, C, wd, wh, ww)
-        # A_cross: target attends to its own values
-        A_cross = torch.bmm(V_t, attn_self.transpose(1, 2)).view(N, C, wd, wh, ww)
-        return A_self, A_cross
+            # Attention weights [N, L, L]
+            attn_cross = torch.bmm(Q_t.transpose(1, 2), K_s) * self.scale   # [N, L, L]
+            attn_cross = attn_cross.softmax(dim=-1)
+            attn_self  = torch.bmm(Q_t.transpose(1, 2), K_t) * self.scale
+            attn_self  = attn_self.softmax(dim=-1)
+
+            # A_cross: target attends to source values (cross-attention)
+            A_cross = torch.bmm(V_s, attn_cross.transpose(1, 2)).view(N, C, wd, wh, ww)
+            # A_self: target attends to its own values (self-attention)
+            A_self  = torch.bmm(V_t, attn_self.transpose(1, 2)).view(N, C, wd, wh, ww)
+
+        return A_cross.to(orig_dtype), A_self.to(orig_dtype)
 
     def forward(self, x_ct: torch.Tensor, x_pet: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -230,12 +168,12 @@ class BDSABlock(nn.Module):
         MCSAFusion.forward adds the single outer residual.
         """
         # PET -> CT: CT is target, PET is source
-        A_self_ct,  A_cross_ct  = self._attend(source=x_pet, target=x_ct)
-        e_ct  = self.mixer(torch.cat([A_self_ct,  A_cross_ct],  dim=1))
+        A_cross_ct, A_self_ct = self._attend(source=x_pet, target=x_ct)
+        e_ct  = self.mixer(torch.cat([A_cross_ct, A_self_ct], dim=1))
 
         # CT -> PET: PET is target, CT is source
-        A_self_pet, A_cross_pet = self._attend(source=x_ct,  target=x_pet)
-        e_pet = self.mixer(torch.cat([A_self_pet, A_cross_pet], dim=1))
+        A_cross_pet, A_self_pet = self._attend(source=x_ct, target=x_pet)
+        e_pet = self.mixer(torch.cat([A_cross_pet, A_self_pet], dim=1))
 
         return e_ct, e_pet
 
@@ -250,7 +188,6 @@ class MCSAFusion(nn.Module):
       merge windows back.
 
     Outputs (e_ct, e_pet) — both enhanced, C channels each.
-    Used inside CombinedFusion or directly as a fusion module (returns avg of pair).
     """
 
     def __init__(self, in_channels: int, window_size: Tuple[int, int, int] = (4, 4, 4)):
@@ -279,8 +216,10 @@ class MCSAFusion(nn.Module):
     def _intra_attention(self, x_ct: torch.Tensor, x_pet: torch.Tensor,
                           ws: Tuple[int, int, int]) -> Tuple[torch.Tensor, torch.Tensor]:
         """Partition into windows, attend inside each window, merge back."""
-        x_ct,  pads = _pad_to_divisible_3d(x_ct,  ws)
-        x_pet, _    = _pad_to_divisible_3d(x_pet, ws)
+        x_ct,  pads     = _pad_to_divisible_3d(x_ct,  ws)
+        x_pet, pads_pet = _pad_to_divisible_3d(x_pet, ws)
+        # skip_ct and skip_pet must have identical spatial dims (same encoder stage).
+        assert pads == pads_pet, "CT and PET skip spatial shapes diverged — padding mismatch"
         D, H, W = x_ct.shape[2], x_ct.shape[3], x_ct.shape[4]
 
         w_ct  = _window_partition_3d(x_ct,  ws)   # [nW*B, C, wd, wh, ww]
@@ -310,41 +249,34 @@ class MCSAFusion(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Variant C: Combined — MCSA -> TAMWLite
-# ---------------------------------------------------------------------------
-
-class CombinedFusion(nn.Module):
-    """MCSA bidirectional attention followed by TAMWLite channel gating."""
-
-    def __init__(self, in_channels: int, window_size: Tuple[int, int, int] = (4, 4, 4)):
-        super().__init__()
-        self.mcsa = MCSAFusion(in_channels, window_size)
-        self.tamw = TAMWLiteFusion(in_channels)
-
-    def forward(self, skip_ct: torch.Tensor, skip_pet: torch.Tensor) -> torch.Tensor:
-        e_ct, e_pet = self.mcsa(skip_ct, skip_pet)
-        return self.tamw(e_ct, e_pet)
-
-
-# ---------------------------------------------------------------------------
-# Wrapper: makes MCSAFusion return a single tensor (averaged pair)
-# Used when MCSAFusion is the terminal fusion module (Variant B standalone).
+# Wrapper: makes MCSAFusion return a single tensor
 # ---------------------------------------------------------------------------
 
 class MCSAFusionWrapper(nn.Module):
-    """Wraps MCSAFusion to return a single fused tensor (mean of enhanced pair)."""
+    """
+    Wraps MCSAFusion to return a single fused tensor.
+
+    Projects the concatenated enhanced features [e_ct, e_pet] → C via a 2C→C conv +
+    InstanceNorm + LeakyReLU + 1×1 conv (zero-init final conv → delta is 0 at init).
+    An explicit residual bypass ensures CT-passthrough at epoch 0:
+      output = e_ct + proj(cat([e_ct, e_pet]))
+    At init: e_ct = skip_ct (MCSAFusion mixer is zero), proj(...) = 0 (final conv zero).
+    → output = skip_ct exactly.
+    """
 
     def __init__(self, in_channels: int, window_size: Tuple[int, int, int] = (4, 4, 4)):
         super().__init__()
-        self.mcsa = MCSAFusion(in_channels, window_size)
-        self.proj = nn.Conv3d(2 * in_channels, in_channels, kernel_size=1, bias=False)
-        # CT-passthrough init on proj
-        with torch.no_grad():
-            self.proj.weight.zero_()
-            C = in_channels
-            for i in range(C):
-                self.proj.weight[i, i] = 1.0
+        C = in_channels
+        self.mcsa = MCSAFusion(C, window_size)
+        self.proj = nn.Sequential(
+            nn.Conv3d(2 * C, C, kernel_size=1, bias=False),
+            nn.InstanceNorm3d(C, affine=True),
+            nn.LeakyReLU(negative_slope=0.01, inplace=True),
+            nn.Conv3d(C, C, kernel_size=1, bias=False),   # zero-init → CT-passthrough
+        )
+        nn.init.zeros_(self.proj[-1].weight)
 
     def forward(self, skip_ct: torch.Tensor, skip_pet: torch.Tensor) -> torch.Tensor:
         e_ct, e_pet = self.mcsa(skip_ct, skip_pet)
-        return self.proj(torch.cat([e_ct, e_pet], dim=1))
+        # Residual bypass: e_ct = skip_ct at init (mixer zero), proj(...) = 0 (final conv zero)
+        return e_ct + self.proj(torch.cat([e_ct, e_pet], dim=1))
