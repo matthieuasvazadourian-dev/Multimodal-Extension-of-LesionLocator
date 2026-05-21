@@ -1818,7 +1818,9 @@ class LesionLocatorSegmenter(object):
             elif hasattr(m, 'mcsa'):
                 inter_norm = m.mcsa.inter_bdsa.mixer.weight.detach().float().norm().item()
                 intra_norm = m.mcsa.intra_bdsa.mixer.weight.detach().float().norm().item()
-                print(f'  [fusion] L{k}: mixer_inter_norm={inter_norm:.4f}  mixer_intra_norm={intra_norm:.4f}')
+                proj_norm  = m.proj[-1].weight.detach().float().norm().item()
+                print(f'  [fusion] L{k}: mixer_inter_norm={inter_norm:.4f}  '
+                      f'mixer_intra_norm={intra_norm:.4f}  proj_gate_norm={proj_norm:.4f}')
 
     def train_cross_validation(self, train_input_files, train_prompt_files, train_output_files,
                               test_dataset=None, epochs=10, batch_size=2, lr=1e-4,
