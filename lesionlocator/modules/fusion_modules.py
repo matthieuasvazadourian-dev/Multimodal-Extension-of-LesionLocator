@@ -13,6 +13,7 @@ model == CT-only at epoch 0.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.compiler import disable as _compiler_disable
 from typing import Tuple
 
 
@@ -124,6 +125,7 @@ class BDSABlock(nn.Module):
         # mixer near-zero init -> enhanced feature ≈ 0, residual carries signal
         nn.init.zeros_(self.mixer.weight)
 
+    @_compiler_disable
     def _attend(self, source: torch.Tensor, target: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         source, target: [N, C, wd, wh, ww]

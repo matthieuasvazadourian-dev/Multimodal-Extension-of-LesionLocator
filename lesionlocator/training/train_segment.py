@@ -1582,10 +1582,10 @@ class LesionLocatorSegmenter(object):
                                if p.requires_grad and 'fusion_modules' not in n]
             self.optimizer = optim.Adam(
                 [{'params': backbone_params, 'lr': learning_rate},
-                 {'params': fusion_params,   'lr': learning_rate * 5}],
+                 {'params': fusion_params,   'lr': learning_rate * 10}],
                 weight_decay=weight_decay
             )
-            print(f'[intermediate-fusion] Optimizer: backbone lr={learning_rate}, fusion lr={learning_rate * 5}')
+            print(f'[intermediate-fusion] Optimizer: backbone lr={learning_rate}, fusion lr={learning_rate * 10}')
         else:
             self.optimizer = optim.Adam(trainable_params, lr=learning_rate, weight_decay=weight_decay)
 
@@ -2108,6 +2108,8 @@ class LesionLocatorSegmenter(object):
             print("Training...")
 
             _train_dl_iter = enumerate(train_dataloader)
+            _train_consec_fail = 0
+            _train_last_err_cls = None
             while True:
                 try:
                     batch_idx, batch = next(_train_dl_iter)
@@ -2145,6 +2147,8 @@ class LesionLocatorSegmenter(object):
 
                     epoch_train_loss += loss.detach()
                     num_train_batches += 1
+                    _train_consec_fail = 0
+                    _train_last_err_cls = None
 
                     if batch_idx % 10 == 0:
                         # .item() syncs GPU — only pay this cost every 10 batches
@@ -2157,6 +2161,13 @@ class LesionLocatorSegmenter(object):
                     _raise_if_fatal_cuda_error(e, 'training', batch_idx, device)
                     _raise_if_fatal_worker_error(e, 'training', batch_idx, device)
                     _maybe_empty_cache(device)
+                    err_cls = type(e).__name__
+                    _train_consec_fail = _train_consec_fail + 1 if err_cls == _train_last_err_cls else 1
+                    _train_last_err_cls = err_cls
+                    if _train_consec_fail >= 10:
+                        raise RuntimeError(
+                            f"{_train_consec_fail} consecutive {err_cls} errors in training — aborting fold."
+                        ) from e
                     continue
 
             avg_train_loss = (epoch_train_loss / max(num_train_batches, 1)).item()
@@ -2173,6 +2184,8 @@ class LesionLocatorSegmenter(object):
             print("Validating (loss computation on CV fold)...")
             with torch.inference_mode():
                 _val_dl_iter = enumerate(val_dataloader)
+                _val_consec_fail = 0
+                _val_last_err_cls = None
                 while True:
                     try:
                         batch_idx, batch = next(_val_dl_iter)
@@ -2199,6 +2212,8 @@ class LesionLocatorSegmenter(object):
 
                         epoch_val_loss += loss.detach()
                         num_val_batches += 1
+                        _val_consec_fail = 0
+                        _val_last_err_cls = None
 
                         del data, prompt, target, combined_input, outputs, loss
 
@@ -2207,6 +2222,13 @@ class LesionLocatorSegmenter(object):
                         _raise_if_fatal_cuda_error(e, 'validation', batch_idx, device)
                         _raise_if_fatal_worker_error(e, 'validation', batch_idx, device)
                         _maybe_empty_cache(device)
+                        err_cls = type(e).__name__
+                        _val_consec_fail = _val_consec_fail + 1 if err_cls == _val_last_err_cls else 1
+                        _val_last_err_cls = err_cls
+                        if _val_consec_fail >= 10:
+                            raise RuntimeError(
+                                f"{_val_consec_fail} consecutive {err_cls} errors in validation — aborting fold."
+                            ) from e
                         continue
 
             avg_val_loss = (epoch_val_loss / max(num_val_batches, 1)).item()
