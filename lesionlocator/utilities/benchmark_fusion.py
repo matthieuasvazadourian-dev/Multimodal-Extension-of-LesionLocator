@@ -102,18 +102,24 @@ def _count_flops(model: nn.Module, x: torch.Tensor) -> Tuple[float, float]:
         fusion_skip_shapes.append((inputs[0].shape, inputs[1].shape))
 
     handles = [m.register_forward_hook(_hook) for m in model.fusion_modules]
-    with torch.no_grad():
-        fca = FlopCountAnalysis(model, x)
-        fca.unsupported_ops_warnings(True)
-        total_flops = fca.total()
-        unsupported = fca.unsupported_ops()
-        if unsupported:
-            import sys
-            print(f'[benchmark] fvcore unsupported ops (may undercount): {unsupported}', file=sys.stderr)
-        uncalled = fca.uncalled_modules()
-        if uncalled:
-            import sys
-            print(f'[benchmark] fvcore uncalled modules: {uncalled}', file=sys.stderr)
+    try:
+        with torch.no_grad():
+            fca = FlopCountAnalysis(model, x)
+            fca.unsupported_ops_warnings(True)
+            total_flops = fca.total()
+            unsupported = fca.unsupported_ops()
+            if unsupported:
+                import sys
+                print(f'[benchmark] fvcore unsupported ops (may undercount): {unsupported}', file=sys.stderr)
+            uncalled = fca.uncalled_modules()
+            if uncalled:
+                import sys
+                print(f'[benchmark] fvcore uncalled modules: {uncalled}', file=sys.stderr)
+    except Exception as e:
+        for h in handles:
+            h.remove()
+        print(f'[benchmark] fvcore tracing failed ({e.__class__.__name__}: {e}) — skipping FLOPs.')
+        return float('nan'), float('nan')
     for h in handles:
         h.remove()
 
