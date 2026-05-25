@@ -18,7 +18,7 @@ EMPTY_PROMPT=${2:-"False"}
 TEST_DATA=/home/masva/datasets/Dataset901_USZMelanomaPETCT/imagesTr
 TEST_PROMPT=/home/masva/datasets/Dataset901_USZMelanomaPETCT/labelsTr
 SEG_CKPT_ROOT=/home/masva/ckpt/TrainSeg900_PetCT_EarlyFusion
-TRACK_CKPT_ROOT=/scratch/LesionLocator_saved_ckpt/TrainTrack800_FTDec
+TRACK_CKPT_ROOT=/scratch/LesionLocator_saved_ckpt/TrainSeg800_LesionLocatorFTDec
 OUTPUT=/home/masva/vis_pet_track_eval/fold_$FOLD
 COMBINED_CKPT_ROOT="$OUTPUT/combined_ckpt_root"
 
