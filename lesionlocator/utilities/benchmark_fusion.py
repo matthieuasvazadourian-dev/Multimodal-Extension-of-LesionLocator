@@ -15,6 +15,7 @@ Usage:
 """
 
 import argparse
+import gc
 import json
 import pydoc
 import time
@@ -242,6 +243,10 @@ def benchmark_variant(fusion_arch: str, plans_path: str, dataset_path: str,
 
     total_gflops, fusion_gflops = _count_flops(model, x)
     print(f'  total_GFLOPs={total_gflops:.2f}  fusion_GFLOPs={fusion_gflops:.2f}')
+
+    # fvcore forward pass leaves activations in GPU memory — release before timing.
+    gc.collect()
+    torch.cuda.empty_cache()
 
     if device != 'cpu':
         timing = _benchmark_timing(model, x, n_warmup=n_warmup, n_iters=n_iters)
