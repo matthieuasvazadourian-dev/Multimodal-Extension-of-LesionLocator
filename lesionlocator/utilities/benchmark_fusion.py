@@ -44,17 +44,21 @@ def _build_model(plans_path: str, dataset_path: str, fusion_arch: str,
 
     pm = PlansManager(plans)
 
-    # Pick configuration matching the patch size (3D_fullres for 3D models)
+    # Pick a 3D configuration matching the patch size.
+    # petct modality overrides patch on ALL configs (including '2d'), so we must
+    # explicitly skip '2d' to avoid building a Conv2d model on 5D input.
     config_name = None
     for name in pm.available_configurations:
+        if name == '2d':
+            continue
         cm = pm.get_configuration(name, modality='petct')
         if list(cm.patch_size) == list(patch):
             config_name = name
             break
     if config_name is None:
-        # Fall back to first available configuration and warn
-        config_name = pm.available_configurations[0]
-        print(f'[benchmark] No config found for patch {patch}; using {config_name}.')
+        three_d = [n for n in pm.available_configurations if n != '2d']
+        config_name = three_d[0] if three_d else pm.available_configurations[0]
+        print(f'[benchmark] No 3D config matched patch {patch}; using {config_name}.')
 
     cm = pm.get_configuration(config_name, modality='petct')
     arch_class_name = cm.network_arch_class_name
