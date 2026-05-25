@@ -241,13 +241,8 @@ def benchmark_variant(fusion_arch: str, plans_path: str, dataset_path: str,
     # Dummy input: [1, 3, D, H, W] — batch 1, channels CT+PET+prompt
     x = torch.randn(1, 3, *patch, device=device)
 
-    total_gflops, fusion_gflops = _count_flops(model, x)
-    print(f'  total_GFLOPs={total_gflops:.2f}  fusion_GFLOPs={fusion_gflops:.2f}')
-
-    # fvcore forward pass leaves activations in GPU memory — release before timing.
-    gc.collect()
-    torch.cuda.empty_cache()
-
+    # Timing before FLOPs: fvcore holds traced-graph tensors that survive gc.collect(),
+    # contaminating peak-mem measurement. Run timing on a clean allocator, then FLOPs last.
     if device != 'cpu':
         timing = _benchmark_timing(model, x, n_warmup=n_warmup, n_iters=n_iters)
         print(f'  train: iter={timing["iter_ms_mean"]:.1f}±{timing["iter_ms_std"]:.1f} ms  '
@@ -261,6 +256,9 @@ def benchmark_variant(fusion_arch: str, plans_path: str, dataset_path: str,
                       'peak_mem_gb':  float('nan')}
         inf_timing = {'inf_ms_mean':  float('nan'), 'inf_ms_std':  float('nan'),
                       'inf_peak_mem_gb': float('nan')}
+
+    total_gflops, fusion_gflops = _count_flops(model, x)
+    print(f'  total_GFLOPs={total_gflops:.2f}  fusion_GFLOPs={fusion_gflops:.2f}')
 
     return {
         'fusion_arch': fusion_arch,
