@@ -149,17 +149,20 @@ def _benchmark_timing(model: nn.Module, x: torch.Tensor,
     """Run n_warmup forward+backward passes, then measure n_iters."""
     model.train()
     optim = torch.optim.SGD(model.parameters(), lr=1e-5)
+    scaler = torch.cuda.amp.GradScaler()
 
     def _step():
         optim.zero_grad(set_to_none=True)
-        out = model(x)
-        # Deep supervision: out may be list; sum all outputs for a scalar loss
-        if isinstance(out, (list, tuple)):
-            loss = sum(o.mean() for o in out)
-        else:
-            loss = out.mean()
-        loss.backward()
-        optim.step()
+        with torch.cuda.amp.autocast():
+            out = model(x)
+            # Deep supervision: out may be list; sum all outputs for a scalar loss
+            if isinstance(out, (list, tuple)):
+                loss = sum(o.mean() for o in out)
+            else:
+                loss = out.mean()
+        scaler.scale(loss).backward()
+        scaler.step(optim)
+        scaler.update()
 
     # Warm-up
     for _ in range(n_warmup):
@@ -194,7 +197,7 @@ def _benchmark_inference_timing(model: nn.Module, x: torch.Tensor,
     model.eval()
 
     def _step():
-        with torch.inference_mode():
+        with torch.inference_mode(), torch.cuda.amp.autocast():
             _ = model(x)
 
     for _ in range(n_warmup):
