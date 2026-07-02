@@ -45,11 +45,12 @@ mkdir -p "$OUTPUT"
 rm -rf "$ROUTE_TMP"
 
 echo "[route] Partitioning $INPUT by modality presence..."
-python -m lesionlocator.utilities.route_by_modality --images "$INPUT" --outdir "$ROUTE_TMP"
+python -m lesionlocator.utilities.route_by_modality --images "$INPUT" --outdir "$ROUTE_TMP" --prompts "$PROMPT"
 
 run_subset () {   # $1=subset dir name  $2=modality  $3=checkpoint  $4=extra args
   local sub="$1" modality="$2" ckpt="$3" extra="$4"
   local imgs="$ROUTE_TMP/$sub/imagesTr"
+  local prompts="$ROUTE_TMP/$sub/labelsTr"
   if [ ! -d "$imgs" ] || [ -z "$(ls -A "$imgs" 2>/dev/null)" ]; then
     echo "[$sub] no cases, skipping."
     return
@@ -57,7 +58,7 @@ run_subset () {   # $1=subset dir name  $2=modality  $3=checkpoint  $4=extra arg
   echo "[$sub] routing $(ls -A "$imgs" | wc -l) file(s) -> $modality model"
   LesionLocator_track \
     -i "$imgs" \
-    -p "$PROMPT" \
+    -p "$prompts" \
     -m "$ckpt" \
     -o "$OUTPUT/$sub" \
     -f "$FOLD" \

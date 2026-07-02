@@ -20,9 +20,17 @@ each non-empty subset. No case is copied — only symlinked.
 For the PET-only subset the PET file (`_0001`) is symlinked as `_0000`, because
 the unimodal PET model expects its single input on channel 0.
 
+If `--prompts` is given, the matching per-case prompt file (named `<case_id>`
++ file ending, or `<case_id>.json`, with no channel suffix) is symlinked into
+a parallel `labelsTr` subdirectory for each subset. This is required because
+the inference entrypoint asserts that the number of prompt files equals the
+number of image cases in the folder it's given — the full, unfiltered prompt
+directory would fail that check against a routed subset.
+
 Usage:
     python -m lesionlocator.utilities.route_by_modality \
-        --images /path/to/imagesTr --outdir /tmp/route [--file-ending .nii.gz]
+        --images /path/to/imagesTr --outdir /tmp/route [--file-ending .nii.gz] \
+        [--prompts /path/to/labelsTr]
 
 Prints a JSON summary {"petct": n, "ct": n, "pet": n} to stdout.
 """
@@ -68,7 +76,19 @@ def _symlink(src: str, dst: str) -> None:
     os.symlink(os.path.abspath(src), dst)
 
 
-def route(images_dir: str, outdir: str, file_ending: str) -> dict:
+def _route_prompt(prompts_dir: str, outdir: str, subset: str, cid: str, file_ending: str) -> None:
+    """Symlink the per-case prompt file (mask or json) into <outdir>/<subset>/labelsTr/."""
+    mask_src = os.path.join(prompts_dir, f"{cid}{file_ending}")
+    json_src = os.path.join(prompts_dir, f"{cid}.json")
+    if os.path.exists(mask_src):
+        _symlink(mask_src, os.path.join(outdir, subset, "labelsTr", f"{cid}{file_ending}"))
+    elif os.path.exists(json_src):
+        _symlink(json_src, os.path.join(outdir, subset, "labelsTr", f"{cid}.json"))
+    else:
+        raise FileNotFoundError(f"No prompt file found for case {cid} in {prompts_dir}")
+
+
+def route(images_dir: str, outdir: str, file_ending: str, prompts_dir: str = None) -> dict:
     """Build petct/ct/pet symlink subdirs under outdir. Returns per-subset counts."""
     cases = partition_cases(images_dir, file_ending)
     counts = {"petct": 0, "ct": 0, "pet": 0}
@@ -76,16 +96,21 @@ def route(images_dir: str, outdir: str, file_ending: str) -> dict:
     for cid, mods in cases.items():
         has_ct, has_pet = mods["ct"] is not None, mods["pet"] is not None
         if has_ct and has_pet:
-            _symlink(mods["ct"],  os.path.join(outdir, "petct", "imagesTr", f"{cid}_0000{file_ending}"))
-            _symlink(mods["pet"], os.path.join(outdir, "petct", "imagesTr", f"{cid}_0001{file_ending}"))
-            counts["petct"] += 1
+            subset = "petct"
+            _symlink(mods["ct"],  os.path.join(outdir, subset, "imagesTr", f"{cid}_0000{file_ending}"))
+            _symlink(mods["pet"], os.path.join(outdir, subset, "imagesTr", f"{cid}_0001{file_ending}"))
         elif has_ct:
-            _symlink(mods["ct"], os.path.join(outdir, "ct", "imagesTr", f"{cid}_0000{file_ending}"))
-            counts["ct"] += 1
+            subset = "ct"
+            _symlink(mods["ct"], os.path.join(outdir, subset, "imagesTr", f"{cid}_0000{file_ending}"))
         elif has_pet:
+            subset = "pet"
             # normalize PET onto channel 0 for the unimodal PET model
-            _symlink(mods["pet"], os.path.join(outdir, "pet", "imagesTr", f"{cid}_0000{file_ending}"))
-            counts["pet"] += 1
+            _symlink(mods["pet"], os.path.join(outdir, subset, "imagesTr", f"{cid}_0000{file_ending}"))
+        else:
+            continue
+        counts[subset] += 1
+        if prompts_dir is not None:
+            _route_prompt(prompts_dir, outdir, subset, cid, file_ending)
 
     return counts
 
@@ -96,9 +121,11 @@ def main():
     parser.add_argument("--images", required=True, help="Input imagesTr directory (mixed modalities)")
     parser.add_argument("--outdir", required=True, help="Output dir for petct/ct/pet symlink subsets")
     parser.add_argument("--file-ending", default=".nii.gz")
+    parser.add_argument("--prompts", default=None,
+                        help="Optional prompt/labels directory to route in parallel (per-case, no channel suffix)")
     args = parser.parse_args()
 
-    counts = route(args.images, args.outdir, args.file_ending)
+    counts = route(args.images, args.outdir, args.file_ending, args.prompts)
     print(json.dumps(counts))
 
 
