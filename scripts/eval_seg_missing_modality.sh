@@ -7,7 +7,7 @@ set -euo pipefail
 #   CT + PET -> fusion model (petct)   CT only -> CT model   PET only -> PET model
 # No core inference changes; pure orchestration over the existing entry points.
 #
-# Usage: ./scripts/eval_seg_missing_modality.sh <fold> [weighted|mcsa]
+# Usage: ./scripts/eval_seg_missing_modality.sh <fold> [weighted|mcsa] [input_dir]
 
 source /opt/conda/etc/profile.d/conda.sh
 conda activate lesionlocator
@@ -23,7 +23,7 @@ FOLD=${1:?"Usage: $0 <fold> [weighted|mcsa]"}
 FUSION_ARCH=${2:-weighted}
 
 # --- Config: input, prompts, checkpoints, output ------------------------------
-INPUT=/home/masva/datasets/Dataset901_USZMelanomaPETCT/imagesTr   # mixed dir to route
+INPUT=${3:-/home/masva/datasets/Dataset901_USZMelanomaPETCT/imagesTr}  # mixed dir to route
 PROMPT=/home/masva/datasets/Dataset901_USZMelanomaPETCT/labelsTr  # labels keyed by case id
 
 if [ "$FUSION_ARCH" = "mcsa" ]; then
