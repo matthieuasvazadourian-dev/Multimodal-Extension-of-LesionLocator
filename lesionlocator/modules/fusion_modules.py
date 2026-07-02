@@ -256,6 +256,95 @@ class MCSAFusion(nn.Module):
 # Wrapper: makes MCSAFusion return a single tensor
 # ---------------------------------------------------------------------------
 
+class SharedSpecificFusion(nn.Module):
+    """
+    Variant C: ShaSpec (Wang et al., CVPR 2023) shared/specific feature fusion,
+    applied per skip level.
+
+    For each modality m the (shared) encoder feature feat_m is projected into:
+      - a SHARED representation  s_m = shared_proj(feat_m)   (shared weights across
+        modalities -> encouraged modality-invariant by the distribution-alignment
+        loss, so s_ct and s_pet become interchangeable)
+      - a SPECIFIC representation p_m = spec_m(feat_m)       (per-modality)
+
+    Missing-modality handling: if modality m is absent, its shared feature is
+    SUBSTITUTED by the available modality's shared feature (they are aligned to be
+    interchangeable), and its specific feature is GENERATED from that shared
+    feature via gen_m. This is what makes the network single-modality robust — but
+    only if training actually exercises the path (see modality_dropout in
+    ShaSpecFusionResEncUNet).
+
+    Composition per modality: comp_m = p_m + s_m.
+    Fusion: fused = base + fuse(concat[comp_ct, comp_pet]), where base = feat_ct
+    when CT is present (else comp_ct).
+
+    CT-passthrough init: fuse is zero-initialised, so at epoch 0 (both modalities
+    present) fused = feat_ct exactly — numerically identical to the CT-only
+    backbone, matching the other fusion variants.
+    """
+
+    def __init__(self, in_channels: int):
+        super().__init__()
+        C = in_channels
+        self.shared_proj = nn.Conv3d(C, C, kernel_size=1, bias=False)  # shared across modalities
+        self.spec_ct     = nn.Conv3d(C, C, kernel_size=1, bias=False)
+        self.spec_pet    = nn.Conv3d(C, C, kernel_size=1, bias=False)
+        self.gen_ct      = nn.Conv3d(C, C, kernel_size=1, bias=False)  # missing CT specific <- shared
+        self.gen_pet     = nn.Conv3d(C, C, kernel_size=1, bias=False)  # missing PET specific <- shared
+        self.fuse        = nn.Conv3d(2 * C, C, kernel_size=1, bias=False)
+        nn.init.zeros_(self.fuse.weight)  # zero-init -> CT-passthrough at epoch 0
+
+    def forward(self, feat_ct, feat_pet, has_ct: bool = True, has_pet: bool = True):
+        """
+        feat_ct, feat_pet: [B, C, D, H, W] encoder features for this level, or None
+        if the corresponding modality was dropped this iteration.
+
+        Returns (fused, s_ct, s_pet, both_present):
+          fused           : [B, C, D, H, W] fused feature for the decoder
+          s_ct, s_pet     : shared features (post-substitution) — for aux losses
+          both_present    : True iff neither modality was dropped (genuine shared
+                            features, so distribution-alignment is meaningful)
+        """
+        s_ct  = self.shared_proj(feat_ct)  if has_ct  else None
+        s_pet = self.shared_proj(feat_pet) if has_pet else None
+
+        # Substitute the missing modality's shared feature with the available one.
+        if s_ct is None:
+            s_ct = s_pet
+        if s_pet is None:
+            s_pet = s_ct
+
+        p_ct  = self.spec_ct(feat_ct)   if has_ct  else self.gen_ct(s_ct)
+        p_pet = self.spec_pet(feat_pet) if has_pet else self.gen_pet(s_pet)
+
+        comp_ct  = p_ct  + s_ct
+        comp_pet = p_pet + s_pet
+
+        base = feat_ct if has_ct else comp_ct
+        fused = base + self.fuse(torch.cat([comp_ct, comp_pet], dim=1))
+
+        return fused, s_ct, s_pet, (has_ct and has_pet)
+
+
+class ShaSpecDomainClassifier(nn.Module):
+    """
+    Domain-classification head for ShaSpec: predicts which modality a shared
+    feature came from, from the globally-pooled deepest-level shared feature.
+
+    A plain (non-adversarial) classifier, as in the original paper — it pushes the
+    shared branch to retain domain-discriminative information, complementing the
+    distribution-alignment loss.
+    """
+
+    def __init__(self, in_channels: int, n_domains: int = 2):
+        super().__init__()
+        self.fc = nn.Linear(in_channels, n_domains)
+
+    def forward(self, shared_feat: torch.Tensor) -> torch.Tensor:
+        pooled = F.adaptive_avg_pool3d(shared_feat, 1).flatten(1)  # [B, C]
+        return self.fc(pooled)                                     # [B, n_domains]
+
+
 class MCSAFusionWrapper(nn.Module):
     """
     Wraps MCSAFusion to return a single fused tensor.

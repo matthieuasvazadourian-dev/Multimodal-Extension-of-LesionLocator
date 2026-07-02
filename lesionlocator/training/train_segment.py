@@ -558,13 +558,15 @@ class LesionLocatorSegmenter(object):
                                              use_folds: Union[Tuple[Union[int, str]], None],
                                              modality: str = 'ct',
                                              checkpoint_name: str = 'checkpoint_final.pth',
-                                             fusion_arch: str = None):
+                                             fusion_arch: str = None,
+                                             shaspec_kwargs: dict = None):
         """
         This is used when making predictions with a trained model
         """
         print("Loading segmentation model.")
         self.petct_mode = (modality == 'petct')
         self.intermediate_fusion_mode = (fusion_arch is not None) and (modality == 'petct')
+        self.shaspec_mode = (fusion_arch == 'shaspec') and (modality == 'petct')
         self.fusion_arch = fusion_arch
         self.first_conv_key = None
         self.first_conv_expected_in_ch = None
@@ -612,10 +614,21 @@ class LesionLocatorSegmenter(object):
         arch_init_kwargs = configuration_manager.network_arch_init_kwargs
         arch_init_kwargs_req_import = configuration_manager.network_arch_init_kwargs_req_import
         if self.intermediate_fusion_mode:
-            arch_class_name = 'lesionlocator.modules.multimodal_unet.IntermediateFusionResEncUNet'
             arch_init_kwargs = dict(arch_init_kwargs)
-            arch_init_kwargs['fusion_arch'] = self.fusion_arch
-            print(f'[intermediate-fusion] Using IntermediateFusionResEncUNet with fusion_arch={self.fusion_arch}')
+            if self.shaspec_mode:
+                arch_class_name = 'lesionlocator.modules.multimodal_unet.ShaSpecFusionResEncUNet'
+                sk = shaspec_kwargs or {}
+                for key in ('modality_dropout_p', 'lambda_da', 'lambda_dc'):
+                    if sk.get(key) is not None:
+                        arch_init_kwargs[key] = sk[key]
+                print(f'[shaspec] Using ShaSpecFusionResEncUNet '
+                      f'(modality_dropout_p={arch_init_kwargs.get("modality_dropout_p", 0.5)}, '
+                      f'lambda_da={arch_init_kwargs.get("lambda_da", 0.1)}, '
+                      f'lambda_dc={arch_init_kwargs.get("lambda_dc", 0.1)})')
+            else:
+                arch_class_name = 'lesionlocator.modules.multimodal_unet.IntermediateFusionResEncUNet'
+                arch_init_kwargs['fusion_arch'] = self.fusion_arch
+                print(f'[intermediate-fusion] Using IntermediateFusionResEncUNet with fusion_arch={self.fusion_arch}')
 
         network = trainer_class.build_network_architecture(
             arch_class_name,
@@ -669,6 +682,9 @@ class LesionLocatorSegmenter(object):
                 def _is_expected_missing(k: str) -> bool:
                     if k.startswith('fusion_modules'):
                         return True
+                    # ShaSpec domain-classification head: new params, absent in CT seed.
+                    if k.startswith('shaspec_domain_classifier'):
+                        return True
                     # Aux DS heads (index 1+): in DS=True model, absent in DS=False CT seed.
                     # decoder.seg_layers.0 (primary head) must be present — do NOT ignore it.
                     if (k.startswith('decoder.seg_layers.')
@@ -700,7 +716,8 @@ class LesionLocatorSegmenter(object):
         self.allowed_mirroring_axes = inference_allowed_mirroring_axes
         self.label_manager = plans_manager.get_label_manager(dataset_json)
         if ('LesionLocator_compile' in os.environ.keys()) and (os.environ['LesionLocator_compile'].lower() in ('true', '1', 't')) \
-                and not isinstance(self.network, OptimizedModule):
+                and not isinstance(self.network, OptimizedModule) \
+                and not getattr(self, 'shaspec_mode', False):
             import shutil
             if shutil.which('gcc') is None and shutil.which('cc') is None:
                 raise RuntimeError(
@@ -1690,6 +1707,20 @@ class LesionLocatorSegmenter(object):
             trainable_label = "Trainable parameters before PET+CT first-conv override"
         print(f"{trainable_label}: {trainable_params:,} / {total_params:,} ({100*trainable_params/total_params:.1f}%)")
 
+    def _add_shaspec_aux(self, loss):
+        """Add ShaSpec aux loss (distribution alignment + domain classification).
+
+        The network computes and stashes it on `last_aux_loss` during the forward
+        pass, but only while training — so this is a no-op during validation.
+        """
+        if not getattr(self, 'shaspec_mode', False):
+            return loss
+        net = self.network._orig_mod if isinstance(self.network, OptimizedModule) else self.network
+        aux = getattr(net, 'last_aux_loss', None)
+        if net.training and aux is not None:
+            return loss + aux
+        return loss
+
     def _combined_loss(self, predictions, targets):
         """Combined CrossEntropy + Dice loss. Handles deep supervision (list of predictions)."""
         if isinstance(predictions, (list, tuple)):
@@ -1715,10 +1746,10 @@ class LesionLocatorSegmenter(object):
                         mode='nearest',
                     ).squeeze(1).long()
                 total_loss = total_loss + w * (self._ce_loss(pred, t) + dice_loss(pred, t))
-            return total_loss
+            return self._add_shaspec_aux(total_loss)
         ce_loss = self._ce_loss(predictions, targets.long())
         dice_loss_val = dice_loss(predictions, targets)
-        return ce_loss + dice_loss_val
+        return self._add_shaspec_aux(ce_loss + dice_loss_val)
 
     def _visualize_validation_sample(self, data, target, prediction, filename, output_folder, epoch):
         """
@@ -2753,9 +2784,17 @@ def train_from_prompt():
                         help='Set this flag to enable tracking. This will use the LesionLocatorTrack model to track lesions.')
     parser.add_argument('--modality', type=str, required=True, choices=['ct', 'pet', 'petct'], default='ct', help="Use this to set the modality. Use 'petct' for early-fusion PET+CT (requires Dataset900/901 with _0000 CT and _0001 PET files).")
     parser.add_argument('--fusion_arch', type=str, required=False, default=None,
-                        choices=['weighted', 'mcsa'],
-                        help="Intermediate feature-level fusion variant for PET+CT. One of weighted/mcsa. "
-                             "Only used when --modality petct. Omit for early fusion (default behaviour).")
+                        choices=['weighted', 'mcsa', 'shaspec'],
+                        help="Intermediate feature-level fusion variant for PET+CT. One of weighted/mcsa/shaspec. "
+                             "Only used when --modality petct. Omit for early fusion (default behaviour). "
+                             "'shaspec' adds shared/specific fusion with missing-modality robustness.")
+    parser.add_argument('--shaspec_dropout_p', type=float, required=False, default=0.5,
+                        help="ShaSpec only: probability of dropping one modality per training iteration "
+                             "(simulates missing modality so the substitution path is learned). Default: 0.5")
+    parser.add_argument('--shaspec_lambda_da', type=float, required=False, default=0.1,
+                        help="ShaSpec only: weight of the distribution-alignment aux loss. Default: 0.1")
+    parser.add_argument('--shaspec_lambda_dc', type=float, required=False, default=0.1,
+                        help="ShaSpec only: weight of the domain-classification aux loss. Default: 0.1")
     parser.add_argument('--adaptive_mode', action='store_true', help='Enable selection between segmentation and tracking based on Dice/NSD scores.')
     
     # Training arguments
@@ -2833,7 +2872,12 @@ def train_from_prompt():
     checkpoint_folder = join(args.m, 'LesionLocatorSeg', optimized_ckpt)
     checkpoint_folder_track = join(args.m, 'LesionLocatorTrack')
     predictor.initialize_from_trained_model_folder(checkpoint_folder, checkpoint_folder_track, args.f, args.modality, "checkpoint_final.pth",
-                                                    fusion_arch=getattr(args, 'fusion_arch', None))
+                                                    fusion_arch=getattr(args, 'fusion_arch', None),
+                                                    shaspec_kwargs={
+                                                        'modality_dropout_p': getattr(args, 'shaspec_dropout_p', None),
+                                                        'lambda_da': getattr(args, 'shaspec_lambda_da', None),
+                                                        'lambda_dc': getattr(args, 'shaspec_lambda_dc', None),
+                                                    })
     
     # Training mode
     print("Starting training mode...")

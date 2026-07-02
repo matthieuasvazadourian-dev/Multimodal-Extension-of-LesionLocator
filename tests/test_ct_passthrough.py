@@ -45,6 +45,13 @@ def _build_ct_only():
 
 
 def _build_fusion(fusion_arch: str):
+    if fusion_arch == "shaspec":
+        from lesionlocator.modules.multimodal_unet import ShaSpecFusionResEncUNet
+        return ShaSpecFusionResEncUNet(
+            input_channels=3,
+            num_classes=2,
+            **_ARCH_KWARGS,
+        )
     from lesionlocator.modules.multimodal_unet import IntermediateFusionResEncUNet
     return IntermediateFusionResEncUNet(
         input_channels=3,
@@ -54,7 +61,7 @@ def _build_fusion(fusion_arch: str):
     )
 
 
-@pytest.mark.parametrize("fusion_arch", ["weighted", "mcsa"])
+@pytest.mark.parametrize("fusion_arch", ["weighted", "mcsa", "shaspec"])
 def test_ct_passthrough_at_init(fusion_arch: str):
     """
     At init (CT-passthrough), fusion model on [CT, zeros_PET, prompt]
@@ -67,7 +74,10 @@ def test_ct_passthrough_at_init(fusion_arch: str):
 
     # Load CT-only weights into fusion model (strict=False, fusion keys are missing)
     missing, unexpected = fusion_model.load_state_dict(ct_model.state_dict(), strict=False)
-    non_fusion_missing = [k for k in missing if 'fusion_modules' not in k]
+    non_fusion_missing = [
+        k for k in missing
+        if 'fusion_modules' not in k and not k.startswith('shaspec_domain_classifier')
+    ]
     assert not non_fusion_missing, f"Non-fusion keys missing: {non_fusion_missing}"
     assert not unexpected, f"Unexpected keys: {unexpected}"
 

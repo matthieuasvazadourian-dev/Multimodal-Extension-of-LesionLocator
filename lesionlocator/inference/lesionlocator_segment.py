@@ -172,10 +172,10 @@ class LesionLocatorSegmenter(object):
                     'inference_allowed_mirroring_axes' in checkpoint.keys() else None
                 # Auto-detect fusion_arch from checkpoint when not provided via CLI
                 fusion_arch_from_ckpt = checkpoint.get('fusion_arch', None)
-                if fusion_arch_from_ckpt not in (None, 'weighted', 'mcsa'):
+                if fusion_arch_from_ckpt not in (None, 'weighted', 'mcsa', 'shaspec'):
                     raise ValueError(
                         f"Checkpoint uses removed fusion_arch='{fusion_arch_from_ckpt}'. "
-                        f"Old TAMW/Combined checkpoints are incompatible with current code. Retrain with --fusion_arch weighted or mcsa."
+                        f"Old TAMW/Combined checkpoints are incompatible with current code. Retrain with --fusion_arch weighted, mcsa or shaspec."
                     )
                 if fusion_arch is None and fusion_arch_from_ckpt is not None:
                     fusion_arch = fusion_arch_from_ckpt
@@ -190,6 +190,7 @@ class LesionLocatorSegmenter(object):
         # PET+CT: patch dataset_json so that num_input_channels = 2 (both fusion modes).
         self.petct_mode = (modality == 'petct')
         self.intermediate_fusion_mode = (fusion_arch is not None) and (modality == 'petct')
+        self.shaspec_mode = (fusion_arch == 'shaspec') and (modality == 'petct')
         self.fusion_arch = fusion_arch
         self.first_conv_key = None
         if self.petct_mode:
@@ -210,10 +211,14 @@ class LesionLocatorSegmenter(object):
         arch_init_kwargs = configuration_manager.network_arch_init_kwargs
         arch_init_kwargs_req_import = configuration_manager.network_arch_init_kwargs_req_import
         if self.intermediate_fusion_mode:
-            arch_class_name = 'lesionlocator.modules.multimodal_unet.IntermediateFusionResEncUNet'
             arch_init_kwargs = dict(arch_init_kwargs)
-            arch_init_kwargs['fusion_arch'] = self.fusion_arch
-            print(f'[intermediate-fusion] Using IntermediateFusionResEncUNet with fusion_arch={self.fusion_arch}')
+            if self.shaspec_mode:
+                arch_class_name = 'lesionlocator.modules.multimodal_unet.ShaSpecFusionResEncUNet'
+                print('[shaspec] Using ShaSpecFusionResEncUNet (inference).')
+            else:
+                arch_class_name = 'lesionlocator.modules.multimodal_unet.IntermediateFusionResEncUNet'
+                arch_init_kwargs['fusion_arch'] = self.fusion_arch
+                print(f'[intermediate-fusion] Using IntermediateFusionResEncUNet with fusion_arch={self.fusion_arch}')
 
         network = trainer_class.build_network_architecture(
             arch_class_name,
@@ -257,6 +262,7 @@ class LesionLocatorSegmenter(object):
                 non_fusion_missing = [
                     k for k in missing
                     if not k.startswith('fusion_modules')
+                    and not k.startswith('shaspec_domain_classifier')
                     and not (k.startswith('decoder.seg_layers.')
                              and not k.startswith('decoder.seg_layers.0.'))
                 ]
@@ -835,8 +841,8 @@ def predict_seg_from_prompt():
 
     parser.add_argument('--modality', type=str, required=True, choices=['ct', 'pet', 'petct'], default='ct', help="Use this to set the modality")
     parser.add_argument('--fusion_arch', type=str, required=False, default=None,
-                        choices=['weighted', 'mcsa'],
-                        help="Intermediate feature-level fusion variant for PET+CT. One of weighted/mcsa. "
+                        choices=['weighted', 'mcsa', 'shaspec'],
+                        help="Intermediate feature-level fusion variant for PET+CT. One of weighted/mcsa/shaspec. "
                              "Only used when --modality petct. Omit for early fusion (default behaviour).")
     print(
         "\n#######################################################################\nPlease cite the following paper "
