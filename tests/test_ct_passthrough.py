@@ -15,7 +15,8 @@ import pytest
 import torch
 
 # Minimal architecture kwargs that match the 7-stage nnUNet ResEnc config.
-# These mirror plans.json for Dataset900/petct but at a tiny patch for fast CPU testing.
+# These mirror plans.json for Dataset900/petct but at a reduced patch for CPU testing
+# (see _PATCH_D/_PATCH_H/_PATCH_W below — smaller collapses to a 1-voxel bottleneck).
 _ARCH_KWARGS = dict(
     n_stages=7,
     features_per_stage=[32, 64, 128, 256, 512, 512, 512],
@@ -33,6 +34,14 @@ _ARCH_KWARGS = dict(
     nonlin_kwargs={'inplace': True},
     deep_supervision=False,  # explicit: keeps both models consistent and simplifies output comparison
 )
+
+# Smallest patch that survives all 7 stages without collapsing to a 1-voxel
+# spatial dim: strides above downsample D by a cumulative 2^5=32x (5 of the 7
+# stages stride D) and H/W by 2^6=64x (6 of the 7 stages stride H/W). A
+# 1x1x1 feature map at the deepest stage makes InstanceNorm3d raise (no
+# track_running_stats -> always computes a live variance, even in eval/
+# inference_mode), so D must be a multiple of 32 and H/W a multiple of 64.
+_PATCH_D, _PATCH_H, _PATCH_W = 64, 128, 128
 
 
 def _build_ct_only():
@@ -86,8 +95,7 @@ def test_ct_passthrough_at_init(fusion_arch: str, missing_modality_robust: bool)
     assert not non_fusion_missing, f"Non-fusion keys missing: {non_fusion_missing}"
     assert not unexpected, f"Unexpected keys: {unexpected}"
 
-    # Tiny patch for CPU speed
-    B, D, H, W = 1, 16, 16, 16
+    B, D, H, W = 1, _PATCH_D, _PATCH_H, _PATCH_W
     torch.manual_seed(42)
     x_ct     = torch.randn(B, 1, D, H, W)
     x_prompt = torch.randn(B, 1, D, H, W)
@@ -122,7 +130,7 @@ def test_missing_modality_training_forward(fusion_arch: str):
     model = _build_fusion(fusion_arch, missing_modality_robust=True)
     model.train()
 
-    x = torch.randn(1, 3, 16, 16, 16)
+    x = torch.randn(1, 3, _PATCH_D, _PATCH_H, _PATCH_W)
 
     for has_ct, has_pet in [(True, True), (False, True), (True, False)]:
         model._resolve_modality_mask = lambda hc=has_ct, hp=has_pet: (hc, hp)
@@ -140,7 +148,7 @@ def test_missing_modality_eval_forward(fusion_arch: str):
     """
     torch.manual_seed(0)
     model = _build_fusion(fusion_arch, missing_modality_robust=True).eval()
-    x = torch.randn(1, 3, 16, 16, 16)
+    x = torch.randn(1, 3, _PATCH_D, _PATCH_H, _PATCH_W)
 
     for inference_modality in (None, 'ct', 'pet'):
         model.inference_modality = inference_modality
