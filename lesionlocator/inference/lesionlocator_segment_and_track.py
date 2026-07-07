@@ -177,7 +177,8 @@ class LesionLocatorSegmenter(object):
                                              use_folds: Union[Tuple[Union[int, str]], None],
                                              modality: str = 'ct',
                                              checkpoint_name: str = 'checkpoint_final.pth',
-                                             fusion_arch: str = None):
+                                             fusion_arch: str = None,
+                                             missing_modality_robust: bool = False):
         """
         This is used when making predictions with a trained model
         """
@@ -211,10 +212,10 @@ class LesionLocatorSegmenter(object):
                     'inference_allowed_mirroring_axes' in checkpoint.keys() else None
                 # Auto-detect fusion_arch from checkpoint when not provided via CLI
                 fusion_arch_from_ckpt = checkpoint.get('fusion_arch', None)
-                if fusion_arch_from_ckpt not in (None, 'weighted', 'mcsa', 'shaspec'):
+                if fusion_arch_from_ckpt not in (None, 'weighted', 'mcsa'):
                     raise ValueError(
                         f"Checkpoint uses removed fusion_arch='{fusion_arch_from_ckpt}'. "
-                        f"Old TAMW/Combined checkpoints are incompatible with current code. Retrain with --fusion_arch weighted, mcsa or shaspec."
+                        f"Old TAMW/Combined/ShaSpec checkpoints are incompatible with current code. Retrain with --fusion_arch weighted or mcsa."
                     )
                 if fusion_arch is None and fusion_arch_from_ckpt is not None:
                     fusion_arch = fusion_arch_from_ckpt
@@ -223,6 +224,11 @@ class LesionLocatorSegmenter(object):
                     raise ValueError(
                         f'CLI --fusion_arch={fusion_arch} disagrees with checkpoint fusion_arch={fusion_arch_from_ckpt}'
                     )
+                # Auto-detect missing_modality_robust from checkpoint when not requested via CLI
+                robust_from_ckpt = checkpoint.get('missing_modality_robust', False)
+                if not missing_modality_robust and robust_from_ckpt:
+                    missing_modality_robust = True
+                    print('[intermediate-fusion] Auto-detected missing_modality_robust=True from checkpoint.')
 
             parameters.append(checkpoint['network_weights'])
 
@@ -230,7 +236,7 @@ class LesionLocatorSegmenter(object):
         # both early fusion and intermediate fusion).
         self.petct_mode = (modality == 'petct')
         self.intermediate_fusion_mode = (fusion_arch is not None) and (modality == 'petct')
-        self.shaspec_mode = (fusion_arch == 'shaspec') and (modality == 'petct')
+        self.missing_modality_robust = bool(missing_modality_robust) and self.intermediate_fusion_mode
         self.fusion_arch = fusion_arch
         self.first_conv_key = None
         if self.petct_mode:
@@ -252,13 +258,12 @@ class LesionLocatorSegmenter(object):
         arch_init_kwargs_req_import = configuration_manager.network_arch_init_kwargs_req_import
         if self.intermediate_fusion_mode:
             arch_init_kwargs = dict(arch_init_kwargs)
-            if self.shaspec_mode:
-                arch_class_name = 'lesionlocator.modules.multimodal_unet.ShaSpecFusionResEncUNet'
-                print('[shaspec] Using ShaSpecFusionResEncUNet (inference).')
-            else:
-                arch_class_name = 'lesionlocator.modules.multimodal_unet.IntermediateFusionResEncUNet'
-                arch_init_kwargs['fusion_arch'] = self.fusion_arch
-                print(f'[intermediate-fusion] Using IntermediateFusionResEncUNet with fusion_arch={self.fusion_arch}')
+            arch_class_name = 'lesionlocator.modules.multimodal_unet.IntermediateFusionResEncUNet'
+            arch_init_kwargs['fusion_arch'] = self.fusion_arch
+            if self.missing_modality_robust:
+                arch_init_kwargs['missing_modality_robust'] = True
+            print(f'[intermediate-fusion] Using IntermediateFusionResEncUNet with '
+                  f'fusion_arch={self.fusion_arch}, missing_modality_robust={self.missing_modality_robust}')
 
         network = trainer_class.build_network_architecture(
             arch_class_name,
@@ -303,7 +308,13 @@ class LesionLocatorSegmenter(object):
                 non_fusion_missing = [
                     k for k in missing
                     if not k.startswith('fusion_modules')
-                    and not k.startswith('shaspec_domain_classifier')
+                    and not k.startswith('specific_encoder_ct')
+                    and not k.startswith('specific_encoder_pet')
+                    and not k.startswith('gen_ct')
+                    and not k.startswith('gen_pet')
+                    and not k.startswith('combine_ct')
+                    and not k.startswith('combine_pet')
+                    and not k.startswith('domain_classifier')
                     and not (k.startswith('decoder.seg_layers.')
                              and not k.startswith('decoder.seg_layers.0.'))
                 ]
@@ -1424,9 +1435,14 @@ def segment_and_track():
                         help='Set this flag to enable tracking. This will use the LesionLocatorTrack model to track lesions.')
     parser.add_argument('--modality', type=str, required=True, choices=['ct', 'pet', 'petct'], default='ct', help="Use this to set the modality. Use 'petct' for early-fusion PET+CT (requires dataset with _0000 CT and _0001 PET files).")
     parser.add_argument('--fusion_arch', type=str, required=False, default=None,
-                        choices=['weighted', 'mcsa', 'shaspec'],
-                        help="Intermediate feature-level fusion variant for PET+CT. One of weighted/mcsa/shaspec. "
-                             "Only used when --modality petct. Omit for early fusion (default behaviour).")
+                        choices=['weighted', 'mcsa'],
+                        help="Intermediate feature-level fusion variant for PET+CT. One of weighted/mcsa. "
+                             "Only used when --modality petct. Omit for early fusion (default behaviour). "
+                             "Auto-detected from the checkpoint if omitted.")
+    parser.add_argument('--missing_modality_robust', action='store_true', required=False, default=False,
+                        help="Only used with --modality petct and --fusion_arch weighted/mcsa. Set this if "
+                             "the checkpoint was trained with the ShaSpec-inspired missing-modality "
+                             "robustness add-on. Auto-detected from the checkpoint if omitted.")
     parser.add_argument('--adaptive_mode', action='store_true', help='Enable selection between segmentation and tracking based on Dice/NSD scores.')
     parser.add_argument('--empty_prompt', action='store_true', help='Set this flag if you want to run the predictor with an empty prompt and will likely lead to worse performance.')
 
@@ -1478,7 +1494,8 @@ def segment_and_track():
     checkpoint_folder_track = join(args.m, 'LesionLocatorTrack')
     # checkpoint_folder_track = join(args.m, 'LesionLocatorSeg')
     predictor.initialize_from_trained_model_folder(checkpoint_folder, checkpoint_folder_track, args.f, args.modality, "checkpoint_final.pth",
-                                                    fusion_arch=getattr(args, 'fusion_arch', None))
+                                                    fusion_arch=getattr(args, 'fusion_arch', None),
+                                                    missing_modality_robust=getattr(args, 'missing_modality_robust', False))
     predictor.predict_from_files(args.i, args.o, args.p, args.t,
                                  overwrite=not args.continue_prediction,
                                  num_processes_preprocessing=args.npp,

@@ -8,6 +8,13 @@ Two variants:
 All modules accept (skip_ct, skip_pet) tensors of shape [B, C, D, H, W] and output a
 fused tensor of the same C channels (decoder-compatible). All init to CT-passthrough so
 model == CT-only at epoch 0.
+
+Also defines SpecificFeatureGenerator / SharedSpecificCombiner / DomainClassifier: an
+optional full-fidelity ShaSpec (Wang et al., CVPR 2023) missing-modality robustness
+add-on that sits IN FRONT of either fusion variant above (see
+IntermediateFusionResEncUNet's missing_modality_robust flag, and its real per-modality
+specific_encoder_ct/_pet) — it fabricates a complete shared+specific feature for a
+dropped modality so weighted/mcsa fusion itself never has to handle a missing input.
 """
 
 import torch
@@ -253,96 +260,99 @@ class MCSAFusion(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Wrapper: makes MCSAFusion return a single tensor
+# Missing-modality robustness add-on (ShaSpec, Wang et al. CVPR 2023 —
+# full-fidelity: real per-modality specific encoders, not a cheap linear
+# substitute), layered on top of WeightedSkipFusion / MCSAFusionWrapper — NOT
+# a replacement for either.
+#
+# Per level, each present modality contributes a SHARED feature (from the
+# existing shared-weight backbone encoder, already run per modality) and a
+# SPECIFIC feature (from a dedicated per-modality encoder, IntermediateFusion-
+# ResEncUNet.specific_encoder_ct / _pet). SharedSpecificCombiner merges them
+# into one enriched per-modality feature, zero-init so CT-passthrough holds.
+# When a modality is absent: its shared feature is substituted by direct copy
+# from the present modality (the shared encoder is weight-tied and aligned by
+# the distribution-alignment loss, so no learned adapter is needed there), and
+# SpecificFeatureGenerator fabricates its specific feature from that
+# substituted shared feature. The enriched (comp_ct, comp_pet) pair is then
+# fused exactly as before by the existing fusion_modules[k] (weighted/mcsa),
+# which never has to handle a missing input.
 # ---------------------------------------------------------------------------
 
-class SharedSpecificFusion(nn.Module):
+class SpecificFeatureGenerator(nn.Module):
     """
-    Variant C: ShaSpec (Wang et al., CVPR 2023) shared/specific feature fusion,
-    applied per skip level.
+    Generates an approximation of a modality's SPECIFIC feature from a shared
+    feature (real, if the modality is present and its shared/specific split is
+    just being re-derived; substituted, if the modality is absent).
 
-    For each modality m the (shared) encoder feature feat_m is projected into:
-      - a SHARED representation  s_m = shared_proj(feat_m)   (shared weights across
-        modalities -> encouraged modality-invariant by the distribution-alignment
-        loss, so s_ct and s_pet become interchangeable)
-      - a SPECIFIC representation p_m = spec_m(feat_m)       (per-modality)
-
-    Missing-modality handling: if modality m is absent, its shared feature is
-    SUBSTITUTED by the available modality's shared feature (they are aligned to be
-    interchangeable), and its specific feature is GENERATED from that shared
-    feature via gen_m. This is what makes the network single-modality robust — but
-    only if training actually exercises the path (see modality_dropout in
-    ShaSpecFusionResEncUNet).
-
-    Composition per modality: comp_m = p_m + s_m.
-    Fusion: fused = base + fuse(concat[comp_ct, comp_pet]), where base = feat_ct
-    when CT is present (else comp_ct).
-
-    CT-passthrough init: fuse is zero-initialised, so at epoch 0 (both modalities
-    present) fused = feat_ct exactly — numerically identical to the CT-only
-    backbone, matching the other fusion variants.
+    Conv3d(k1) -> GroupNorm -> LeakyReLU -> Conv3d(k1, zero-init). Zero-init
+    final layer keeps the generator's contribution near-zero early in
+    training, before IntermediateFusionResEncUNet's generator-reconstruction
+    aux loss (see _compute_aux_loss) has taught it anything useful. Two
+    independent instances are used per level (generates CT-specific,
+    generates PET-specific), since the transform need not be symmetric.
     """
 
     def __init__(self, in_channels: int):
         super().__init__()
         C = in_channels
-        self.shared_proj = nn.Conv3d(C, C, kernel_size=1, bias=False)  # shared across modalities
-        self.spec_ct     = nn.Conv3d(C, C, kernel_size=1, bias=False)
-        self.spec_pet    = nn.Conv3d(C, C, kernel_size=1, bias=False)
-        self.gen_ct      = nn.Conv3d(C, C, kernel_size=1, bias=False)  # missing CT specific <- shared
-        self.gen_pet     = nn.Conv3d(C, C, kernel_size=1, bias=False)  # missing PET specific <- shared
-        self.fuse        = nn.Conv3d(2 * C, C, kernel_size=1, bias=False)
-        nn.init.zeros_(self.fuse.weight)  # zero-init -> CT-passthrough at epoch 0
+        self.net = nn.Sequential(
+            nn.Conv3d(C, C, kernel_size=1, bias=False),
+            nn.GroupNorm(min(32, C), C, affine=True),
+            nn.LeakyReLU(negative_slope=0.01, inplace=True),
+            nn.Conv3d(C, C, kernel_size=1, bias=False),
+        )
+        nn.init.zeros_(self.net[-1].weight)
 
-    def forward(self, feat_ct, feat_pet, has_ct: bool = True, has_pet: bool = True):
-        """
-        feat_ct, feat_pet: [B, C, D, H, W] encoder features for this level, or None
-        if the corresponding modality was dropped this iteration.
-
-        Returns (fused, s_ct, s_pet, both_present):
-          fused           : [B, C, D, H, W] fused feature for the decoder
-          s_ct, s_pet     : shared features (post-substitution) — for aux losses
-          both_present    : True iff neither modality was dropped (genuine shared
-                            features, so distribution-alignment is meaningful)
-        """
-        s_ct  = self.shared_proj(feat_ct)  if has_ct  else None
-        s_pet = self.shared_proj(feat_pet) if has_pet else None
-
-        # Substitute the missing modality's shared feature with the available one.
-        if s_ct is None:
-            s_ct = s_pet
-        if s_pet is None:
-            s_pet = s_ct
-
-        p_ct  = self.spec_ct(feat_ct)   if has_ct  else self.gen_ct(s_ct)
-        p_pet = self.spec_pet(feat_pet) if has_pet else self.gen_pet(s_pet)
-
-        comp_ct  = p_ct  + s_ct
-        comp_pet = p_pet + s_pet
-
-        base = feat_ct if has_ct else comp_ct
-        fused = base + self.fuse(torch.cat([comp_ct, comp_pet], dim=1))
-
-        return fused, s_ct, s_pet, (has_ct and has_pet)
+    def forward(self, shared_feat: torch.Tensor) -> torch.Tensor:
+        return self.net(shared_feat).to(shared_feat.dtype)
 
 
-class ShaSpecDomainClassifier(nn.Module):
+class SharedSpecificCombiner(nn.Module):
     """
-    Domain-classification head for ShaSpec: predicts which modality a shared
-    feature came from, from the globally-pooled deepest-level shared feature.
+    Merges a modality's shared and specific features into one enriched
+    feature for that modality:
 
-    A plain (non-adversarial) classifier, as in the original paper — it pushes the
-    shared branch to retain domain-discriminative information, complementing the
-    distribution-alignment loss.
+      comp = shared + proj(concat([shared, specific]))
+
+    Zero-initialised proj -> comp = shared exactly at init, regardless of the
+    (randomly initialised, non-zero) specific feature — this is what keeps
+    CT-passthrough exact even though a whole extra specific encoder now feeds
+    into this path.
+    """
+
+    def __init__(self, in_channels: int):
+        super().__init__()
+        self.proj = nn.Conv3d(2 * in_channels, in_channels, kernel_size=1, bias=False)
+        nn.init.zeros_(self.proj.weight)
+
+    def forward(self, shared_feat: torch.Tensor, specific_feat: torch.Tensor) -> torch.Tensor:
+        return shared_feat + self.proj(torch.cat([shared_feat, specific_feat], dim=1))
+
+
+class DomainClassifier(nn.Module):
+    """
+    Predicts which modality a (raw, pre-fusion) SHARED encoder feature came
+    from, from its globally-pooled deepest-level representation.
+
+    A plain (non-adversarial) classifier, as in ShaSpec (Wang et al., CVPR
+    2023) — it pushes the shared branch to retain a well-defined,
+    domain-discriminative signature, complementing the distribution-alignment
+    loss that pulls the two modalities' shared features together.
     """
 
     def __init__(self, in_channels: int, n_domains: int = 2):
         super().__init__()
         self.fc = nn.Linear(in_channels, n_domains)
 
-    def forward(self, shared_feat: torch.Tensor) -> torch.Tensor:
-        pooled = F.adaptive_avg_pool3d(shared_feat, 1).flatten(1)  # [B, C]
-        return self.fc(pooled)                                     # [B, n_domains]
+    def forward(self, feat: torch.Tensor) -> torch.Tensor:
+        pooled = F.adaptive_avg_pool3d(feat, 1).flatten(1)  # [B, C]
+        return self.fc(pooled)                               # [B, n_domains]
+
+
+# ---------------------------------------------------------------------------
+# Wrapper: makes MCSAFusion return a single tensor
+# ---------------------------------------------------------------------------
 
 
 class MCSAFusionWrapper(nn.Module):

@@ -31,8 +31,9 @@ from dynamic_network_architectures.architectures.unet import ResidualEncoderUNet
 from lesionlocator.modules.fusion_modules import (
     WeightedSkipFusion,
     MCSAFusionWrapper,
-    SharedSpecificFusion,
-    ShaSpecDomainClassifier,
+    SpecificFeatureGenerator,
+    SharedSpecificCombiner,
+    DomainClassifier,
 )
 
 # Minimum encoder level index at which MCSA is applied.
@@ -56,7 +57,47 @@ class IntermediateFusionResEncUNet(ResidualEncoderUNet):
     num_classes : int
         Number of segmentation output classes.
     fusion_arch : str
-        One of {'weighted', 'mcsa'}.
+        One of {'weighted', 'mcsa'}. This governs how the two modalities'
+        skip features are combined at each level and is unaffected by
+        `missing_modality_robust` below.
+    missing_modality_robust : bool
+        Optional full-fidelity ShaSpec (Wang et al., CVPR 2023) add-on for
+        robustness to a missing modality at inference. When False (default),
+        forward() is exactly the original both-modalities-always-present path
+        and no extra parameters are allocated. When True:
+          - Two dedicated per-modality SPECIFIC encoders (`specific_encoder_ct`,
+            `specific_encoder_pet`) are added, each a full independent-weight
+            copy of the backbone encoder architecture (NOT shared with the
+            main `self.encoder`, which already plays ShaSpec's SHARED-encoder
+            role, weight-tied and run once per modality). This roughly
+            doubles encoder-side compute/activation memory relative to
+            weighted/mcsa alone — a deliberate quality-over-memory choice; see
+            benchmark_fusion.md / re-benchmark before assuming this is
+            unaffordable.
+          - Training randomly drops one modality per iteration (probability
+            `modality_dropout_p`). For the dropped modality: its SHARED
+            feature is substituted by direct copy from the present modality
+            (no learned adapter needed — the shared encoder is weight-tied
+            and pulled together by the distribution-alignment loss below),
+            and a `SpecificFeatureGenerator` fabricates its SPECIFIC feature
+            from that substituted shared feature (its real specific encoder
+            is not run, since there is nothing present to feed it).
+          - Per modality, `SharedSpecificCombiner` merges (shared, specific)
+            into one enriched feature; `fusion_modules[k]` (weighted or mcsa,
+            completely unchanged) then fuses the two modalities' enriched
+            features exactly as before.
+          - Three auxiliary losses regularize this: distribution alignment
+            (MSE between the real CT/PET *shared* features, both-present
+            iterations only), domain classification (a classifier predicting
+            which modality a shared feature came from), and generator
+            reconstruction (MSE between each generator's output and the real
+            specific feature it is trying to approximate, supervised only on
+            both-present iterations where a real target exists). Their
+            weighted sum is stashed on `self.last_aux_loss` each forward
+            (only while training) for the trainer to add to the seg loss.
+          - At inference, `self.inference_modality` ('ct'/'pet'/None) selects
+            which modality to treat as missing; None (default) uses both.
+        Does NOT change fusion_modules itself or its CT-passthrough init.
     **kwargs
         All other ResidualEncoderUNet constructor kwargs (conv_op, norm_op, etc.)
         forwarded unchanged to the backbone.
@@ -67,6 +108,11 @@ class IntermediateFusionResEncUNet(ResidualEncoderUNet):
         input_channels: int,
         num_classes: int,
         fusion_arch: str = 'weighted',
+        missing_modality_robust: bool = False,
+        modality_dropout_p: float = 0.5,
+        lambda_da: float = 0.1,
+        lambda_dc: float = 0.1,
+        lambda_gen: float = 0.1,
         **kwargs,
     ):
         assert input_channels == 3, (
@@ -97,6 +143,49 @@ class IntermediateFusionResEncUNet(ResidualEncoderUNet):
             for k in range(n_levels)
         )
 
+        self.missing_modality_robust = bool(missing_modality_robust)
+        if self.missing_modality_robust:
+            self.modality_dropout_p = float(modality_dropout_p)
+            self.lambda_da = float(lambda_da)
+            self.lambda_dc = float(lambda_dc)
+            self.lambda_gen = float(lambda_gen)
+
+            # Real per-modality specific encoders: independent weights, same
+            # architecture as the shared backbone encoder. Built by harvesting
+            # `.encoder` from a throwaway full ResidualEncoderUNet constructed
+            # with the identical kwargs, so we never have to hand-replicate
+            # ResidualEncoder's constructor signature.
+            self.specific_encoder_ct = ResidualEncoderUNet(
+                input_channels=2, num_classes=num_classes, **kwargs
+            ).encoder
+            self.specific_encoder_pet = ResidualEncoderUNet(
+                input_channels=2, num_classes=num_classes, **kwargs
+            ).encoder
+
+            # gen_pet[k]: generates PET's specific feature from a shared feature (used when PET missing)
+            # gen_ct[k]:  generates CT's specific feature from a shared feature (used when CT missing)
+            self.gen_ct = nn.ModuleList(
+                SpecificFeatureGenerator(features[k]) for k in range(n_levels)
+            )
+            self.gen_pet = nn.ModuleList(
+                SpecificFeatureGenerator(features[k]) for k in range(n_levels)
+            )
+            self.combine_ct = nn.ModuleList(
+                SharedSpecificCombiner(features[k]) for k in range(n_levels)
+            )
+            self.combine_pet = nn.ModuleList(
+                SharedSpecificCombiner(features[k]) for k in range(n_levels)
+            )
+            self.domain_classifier = DomainClassifier(features[-1], n_domains=2)
+            self.last_aux_loss = None
+            self.last_da = None
+            self.last_dc = None
+            self.last_gen = None
+            # Inference-time override: None -> both modalities present; 'ct'/'pet' ->
+            # run single-modality (the absent one is substituted/generated). Ignored
+            # while training.
+            self.inference_modality = None
+
     def _make_fusion_module(self, fusion_arch: str, channels: int, level: int) -> nn.Module:
         if fusion_arch == 'weighted':
             return WeightedSkipFusion(channels)
@@ -107,6 +196,19 @@ class IntermediateFusionResEncUNet(ResidualEncoderUNet):
         else:
             raise ValueError(f"Unknown fusion_arch: {fusion_arch}")
 
+    def _resolve_modality_mask(self) -> Tuple[bool, bool]:
+        """Decide which modalities are present for this forward pass (robust mode only)."""
+        if self.training:
+            if self.modality_dropout_p <= 0.0 or torch.rand(()).item() >= self.modality_dropout_p:
+                return True, True
+            drop_ct = torch.rand(()).item() < 0.5   # drop exactly one modality
+            return (not drop_ct), drop_ct
+        if self.inference_modality == 'ct':
+            return True, False
+        if self.inference_modality == 'pet':
+            return False, True
+        return True, True
+
     def forward(self, x: torch.Tensor) -> Union[torch.Tensor, List[torch.Tensor]]:
         """
         x : [B, 3, D, H, W]   channels = [CT, PET, prompt]
@@ -115,172 +217,87 @@ class IntermediateFusionResEncUNet(ResidualEncoderUNet):
         x_pet = x[:, 1:2]    # [B, 1, D, H, W]
         p     = x[:, 2:3]    # [B, 1, D, H, W]
 
-        inp_ct  = torch.cat([x_ct,  p], dim=1)   # [B, 2, D, H, W]
-        inp_pet = torch.cat([x_pet, p], dim=1)   # [B, 2, D, H, W]
-
-        skips_ct  = self.encoder(inp_ct)   # list of n_levels tensors
-        skips_pet = self.encoder(inp_pet)
-
-        skips_fused = [
-            self.fusion_modules[k](skips_ct[k], skips_pet[k])
-            for k in range(len(skips_ct))
-        ]
-
-        return self.decoder(skips_fused)
-
-
-class ShaSpecFusionResEncUNet(ResidualEncoderUNet):
-    """
-    ShaSpec (Wang et al., CVPR 2023) shared/specific fusion U-Net for PET+CT.
-
-    Reuses the single pretrained ResEnc encoder as ShaSpec's SHARED encoder (run
-    per modality), and adds lightweight per-level shared/specific projection heads
-    (SharedSpecificFusion) plus a domain-classification head. This keeps params and
-    activation memory close to the CT baseline — a full separate specific encoder
-    per modality would ~3x the encoder cost, which the memory-constrained cluster
-    can't absorb.
-
-    Missing-modality robustness comes from training with random per-iteration
-    modality dropout (`modality_dropout_p`): when a modality is hidden, its shared
-    feature is substituted from the available modality and its specific feature is
-    generated, so the substitution/generation path receives gradient. Two aux
-    losses regularize the shared space:
-      - distribution alignment: MSE(s_ct, s_pet) over levels (both-present iters)
-      - domain classification:  CE on a modality classifier over the deepest
-                                shared feature
-
-    The combined aux loss for the current forward is stored on `self.last_aux_loss`
-    (with `self.last_da` / `self.last_dc` for logging); the trainer adds it to the
-    segmentation loss. It is only computed while training.
-
-    CT-passthrough init: SharedSpecificFusion.fuse is zero-initialised, so at
-    epoch 0 (both modalities present) the model is numerically identical to the
-    CT-only pretrained backbone.
-    """
-
-    def __init__(
-        self,
-        input_channels: int,
-        num_classes: int,
-        modality_dropout_p: float = 0.5,
-        lambda_da: float = 0.1,
-        lambda_dc: float = 0.1,
-        fusion_arch: str = 'shaspec',  # accepted and ignored (kept for kwarg uniformity)
-        **kwargs,
-    ):
-        assert input_channels == 3, (
-            f"ShaSpecFusionResEncUNet expects input_channels=3 (CT + PET + prompt), "
-            f"got {input_channels}"
-        )
-
-        super().__init__(input_channels=2, num_classes=num_classes, **kwargs)
-
-        self.fusion_arch = 'shaspec'
-        self.modality_dropout_p = float(modality_dropout_p)
-        self.lambda_da = float(lambda_da)
-        self.lambda_dc = float(lambda_dc)
-
-        features = kwargs.get('features_per_stage', None)
-        if features is None:
-            raise ValueError("features_per_stage must be provided in architecture kwargs")
-        if isinstance(features, int):
-            n_stages = kwargs.get('n_stages', 7)
-            features = [features] * n_stages
-        features = list(features)
-        n_levels = len(features)
-
-        # Named 'fusion_modules' so the trainer's existing intermediate-fusion
-        # handling (force-trainable + higher LR + non-strict CT-seed load) applies.
-        self.fusion_modules = nn.ModuleList(
-            SharedSpecificFusion(features[k]) for k in range(n_levels)
-        )
-        # Domain classifier on the deepest level's shared feature.
-        self.shaspec_domain_classifier = ShaSpecDomainClassifier(features[-1], n_domains=2)
-
-        # Populated each forward; consumed by the trainer's loss.
-        self.last_aux_loss = None
-        self.last_da = None
-        self.last_dc = None
-
-        # Inference-time override: None -> both modalities present; 'ct'/'pet' ->
-        # run single-modality (the absent one is substituted/generated). Set this on
-        # the network to evaluate the missing-modality scenario. Ignored while training.
-        self.inference_modality = None
-
-    def _resolve_modality_mask(self) -> Tuple[bool, bool]:
-        """Decide which modalities are present for this forward pass."""
-        if self.training:
-            if self.modality_dropout_p <= 0.0 or torch.rand(()).item() >= self.modality_dropout_p:
-                return True, True
-            drop_ct = torch.rand(()).item() < 0.5   # drop exactly one modality
-            return (not drop_ct), drop_ct
-        # Eval: honour an explicit single-modality request, else use both.
-        if self.inference_modality == 'ct':
-            return True, False
-        if self.inference_modality == 'pet':
-            return False, True
-        return True, True
-
-    def forward(self, x: torch.Tensor):
-        """
-        x : [B, 3, D, H, W]   channels = [CT, PET, prompt]
-        """
-        x_ct  = x[:, 0:1]
-        x_pet = x[:, 1:2]
-        p     = x[:, 2:3]
+        if not self.missing_modality_robust:
+            skips_ct  = self.encoder(torch.cat([x_ct,  p], dim=1))   # list of n_levels tensors
+            skips_pet = self.encoder(torch.cat([x_pet, p], dim=1))
+            skips_fused = [
+                self.fusion_modules[k](skips_ct[k], skips_pet[k])
+                for k in range(len(skips_ct))
+            ]
+            return self.decoder(skips_fused)
 
         has_ct, has_pet = self._resolve_modality_mask()
-
         skips_ct  = self.encoder(torch.cat([x_ct,  p], dim=1)) if has_ct  else None
         skips_pet = self.encoder(torch.cat([x_pet, p], dim=1)) if has_pet else None
+        spec_ct   = self.specific_encoder_ct(torch.cat([x_ct,  p], dim=1))  if has_ct  else None
+        spec_pet  = self.specific_encoder_pet(torch.cat([x_pet, p], dim=1)) if has_pet else None
 
-        n_levels = len(skips_ct if has_ct else skips_pet)
-
+        n_levels = len(self.fusion_modules)
         skips_fused = []
-        shared_ct, shared_pet, both_flags = [], [], []
         for k in range(n_levels):
-            f_ct  = skips_ct[k]  if has_ct  else None
-            f_pet = skips_pet[k] if has_pet else None
-            fused, s_ct, s_pet, both = self.fusion_modules[k](f_ct, f_pet, has_ct, has_pet)
-            skips_fused.append(fused)
-            shared_ct.append(s_ct)
-            shared_pet.append(s_pet)
-            both_flags.append(both)
+            shared_ct_k  = skips_ct[k]  if has_ct  else skips_pet[k]   # substitute = direct copy
+            shared_pet_k = skips_pet[k] if has_pet else skips_ct[k]
+            specific_ct_k  = spec_ct[k]  if has_ct  else self.gen_ct[k](shared_ct_k)
+            specific_pet_k = spec_pet[k] if has_pet else self.gen_pet[k](shared_pet_k)
+            comp_ct  = self.combine_ct[k](shared_ct_k,  specific_ct_k)
+            comp_pet = self.combine_pet[k](shared_pet_k, specific_pet_k)
+            skips_fused.append(self.fusion_modules[k](comp_ct, comp_pet))
 
-        self._compute_aux_loss(shared_ct, shared_pet, both_flags, has_ct, has_pet)
+        self._compute_aux_loss(skips_ct, skips_pet, spec_ct, spec_pet, has_ct, has_pet)
 
         return self.decoder(skips_fused)
 
-    def _compute_aux_loss(self, shared_ct, shared_pet, both_flags, has_ct, has_pet) -> None:
-        """Compute ShaSpec distribution-alignment + domain-classification losses."""
+    def _compute_aux_loss(self, skips_ct, skips_pet, spec_ct, spec_pet,
+                           has_ct: bool, has_pet: bool) -> None:
+        """ShaSpec distribution-alignment + domain-classification + generator-
+        reconstruction aux losses. Operates on the RAW (pre-combine) shared and
+        specific encoder features. Training only.
+        """
         if not self.training:
             self.last_aux_loss = None
             self.last_da = None
             self.last_dc = None
+            self.last_gen = None
             return
 
-        ref = shared_ct[-1]
+        n_levels = len(self.fusion_modules)
+        ref = skips_ct[-1] if has_ct else skips_pet[-1]
         zero = ref.new_zeros(())
 
-        # Distribution alignment: only meaningful on iterations with both modalities.
-        da = zero
-        n_da = 0
-        for s_ct, s_pet, both in zip(shared_ct, shared_pet, both_flags):
-            if both:
-                da = da + F.mse_loss(s_ct, s_pet)
-                n_da += 1
-        da = da / n_da if n_da > 0 else zero
+        # Distribution alignment: pull the two modalities' SHARED features
+        # together so direct-copy substitution is a good approximation.
+        if has_ct and has_pet:
+            da = sum(F.mse_loss(skips_ct[k], skips_pet[k]) for k in range(n_levels)) / n_levels
+        else:
+            da = zero
 
         # Domain classification on the deepest shared feature(s) actually present.
         logits, labels = [], []
         if has_ct:
-            logits.append(self.shaspec_domain_classifier(shared_ct[-1]))
-            labels.append(torch.zeros(shared_ct[-1].shape[0], dtype=torch.long, device=ref.device))
+            logits.append(self.domain_classifier(skips_ct[-1]))
+            labels.append(torch.zeros(skips_ct[-1].shape[0], dtype=torch.long, device=ref.device))
         if has_pet:
-            logits.append(self.shaspec_domain_classifier(shared_pet[-1]))
-            labels.append(torch.ones(shared_pet[-1].shape[0], dtype=torch.long, device=ref.device))
-        dc = F.cross_entropy(torch.cat(logits, 0), torch.cat(labels, 0)) if logits else zero
+            logits.append(self.domain_classifier(skips_pet[-1]))
+            labels.append(torch.ones(skips_pet[-1].shape[0], dtype=torch.long, device=ref.device))
+        dc = F.cross_entropy(torch.cat(logits, 0), torch.cat(labels, 0))
+
+        # Generator reconstruction: only supervisable on both-present iterations,
+        # since that is the only time a real target specific feature exists.
+        # Inputs/targets detached so this loss only trains the generators
+        # themselves, not the shared/specific encoders that produced them.
+        if has_ct and has_pet:
+            gen = zero
+            for k in range(n_levels):
+                pred_pet_specific = self.gen_pet[k](skips_ct[k].detach())
+                pred_ct_specific  = self.gen_ct[k](skips_pet[k].detach())
+                gen = gen + F.mse_loss(pred_pet_specific, spec_pet[k].detach()) \
+                          + F.mse_loss(pred_ct_specific,  spec_ct[k].detach())
+            gen = gen / n_levels
+        else:
+            gen = zero
 
         self.last_da = da
         self.last_dc = dc
-        self.last_aux_loss = self.lambda_da * da + self.lambda_dc * dc
+        self.last_gen = gen
+        self.last_aux_loss = self.lambda_da * da + self.lambda_dc * dc + self.lambda_gen * gen
+
