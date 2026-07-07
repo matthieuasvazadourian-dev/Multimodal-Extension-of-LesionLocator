@@ -22,7 +22,7 @@ _ARCH_KWARGS = dict(
     conv_op=torch.nn.Conv3d,
     kernel_sizes=[[3, 3, 3]] * 7,
     strides=[[1, 1, 1], [2, 2, 2], [2, 2, 2], [2, 2, 2], [2, 2, 2], [2, 2, 2], [1, 2, 2]],
-    n_conv_per_stage=[2, 2, 2, 2, 2, 2, 2],
+    n_blocks_per_stage=[2, 2, 2, 2, 2, 2, 2],
     n_conv_per_stage_decoder=[2, 2, 2, 2, 2, 2],
     conv_bias=True,
     norm_op=torch.nn.InstanceNorm3d,
@@ -31,7 +31,7 @@ _ARCH_KWARGS = dict(
     dropout_op_kwargs=None,
     nonlin=torch.nn.LeakyReLU,
     nonlin_kwargs={'inplace': True},
-    enable_deep_supervision=False,  # explicit: keeps both models consistent and simplifies output comparison
+    deep_supervision=False,  # explicit: keeps both models consistent and simplifies output comparison
 )
 
 
@@ -97,7 +97,7 @@ def test_ct_passthrough_at_init(fusion_arch: str, missing_modality_robust: bool)
         out_ct     = ct_model(torch.cat([x_ct, x_prompt], dim=1))
         out_fusion = fusion_model(torch.cat([x_ct, x_pet, x_prompt], dim=1))
 
-    # DS is off (enable_deep_supervision=False) — both return plain tensors.
+    # DS is off (deep_supervision=False) — both return plain tensors.
     max_diff = (out_fusion - out_ct).abs().max().item()
     assert torch.allclose(out_fusion, out_ct, atol=1e-4), (
         f"CT-passthrough failed for fusion_arch='{fusion_arch}', "
