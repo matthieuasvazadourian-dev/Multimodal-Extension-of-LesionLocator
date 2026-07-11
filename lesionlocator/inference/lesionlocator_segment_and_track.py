@@ -22,6 +22,7 @@ import lesionlocator
 from lesionlocator.preprocessing.resampling.default_resampling import compute_new_shape
 from lesionlocator.configuration import default_num_processes
 from lesionlocator.inference.data_iterators import preprocessing_iterator_fromfiles
+from lesionlocator.utilities.modality_grouping import group_petct_cases_by_modality
 from lesionlocator.inference.export_prediction import export_prediction_from_logits
 from lesionlocator.inference.sliding_window_prediction import compute_gaussian, \
     compute_steps_for_sliding_window
@@ -151,26 +152,43 @@ class LesionLocatorSegmenter(object):
               f'{list(ref_shape)} -> {list(state_dict[extended[0]].shape)}')
         return state_dict
 
-    @staticmethod
-    def _group_input_files_by_case(source_folder: str, file_ending: str, num_modalities: int) -> list:
-        """Return a list of per-case channel groups.
+    def _resolve_network_module(self):
+        """The real nn.Module, unwrapping torch.compile's OptimizedModule
+        wrapper. Setting a plain instance attribute (e.g. inference_modality)
+        on the OptimizedModule wrapper would NOT reach the wrapped module —
+        mirrors the same isinstance check used for load_state_dict below."""
+        return self.network._orig_mod if isinstance(self.network, OptimizedModule) else self.network
 
-        For single-modality datasets each element is a one-element list [file].
-        For multi-modality datasets each element is [_0000_file, _0001_file, ...].
+    def _group_input_files_by_case(self, source_folder: str, file_ending: str, num_modalities: int) -> list:
+        """Return a list of (file_group, inference_modality) pairs.
+
+        For single-modality datasets each file_group is a one-element list
+        [file] and inference_modality is always None.
+
+        For petct (num_modalities == 2, CT=channel 0, PET=channel 1): when
+        both _0000/_0001 exist for a case, file_group is [ct_file, pet_file]
+        and inference_modality is None (unchanged from prior behaviour). When
+        exactly one is missing and the loaded checkpoint is
+        missing_modality_robust, the missing slot is filled with the PRESENT
+        file's own path (a duplicate) and inference_modality is set to 'ct' or
+        'pet'. The duplicate is never read by the network for the absent
+        modality — IntermediateFusionResEncUNet.forward only encodes a
+        channel when its modality is flagged present (multimodal_unet.py,
+        `skips_ct = ... if has_ct else None`) — it exists solely to keep the
+        preprocessor's fixed 2-channel geometry/shape checks satisfied
+        (SimpleITKIO.read_images requires all channels to share shape/spacing).
+        A checkpoint that is NOT missing_modality_robust has no code path for
+        a dropped modality, so a missing file is a hard error in that case
+        (this used to be an unchecked crash inside read_images; now it fails
+        fast with a clear message before preprocessing even starts).
         """
         all_files = subfiles(source_folder, suffix=file_ending, join=True, sort=True)
         if num_modalities == 1:
-            return [[f] for f in all_files]
-        ct_files = sorted(f for f in all_files
-                          if os.path.basename(f).endswith('_0000' + file_ending))
-        groups = []
-        for ct_file in ct_files:
-            group = [ct_file]
-            for c in range(1, num_modalities):
-                other = ct_file.replace(f'_0000{file_ending}', f'_{c:04d}{file_ending}')
-                group.append(other)
-            groups.append(group)
-        return groups
+            return [([f], None) for f in all_files]
+        assert num_modalities == 2, (
+            f"Per-case modality auto-detection only supports CT+PET (2 channels), got num_modalities={num_modalities}."
+        )
+        return group_petct_cases_by_modality(all_files, source_folder, file_ending, self.missing_modality_robust)
 
     def initialize_from_trained_model_folder(self, model_training_output_dir: str,
                                              model_track_training_output_dir: str,
@@ -178,7 +196,8 @@ class LesionLocatorSegmenter(object):
                                              modality: str = 'ct',
                                              checkpoint_name: str = 'checkpoint_final.pth',
                                              fusion_arch: str = None,
-                                             missing_modality_robust: bool = False):
+                                             missing_modality_robust: bool = False,
+                                             force_inference_modality: str = None):
         """
         This is used when making predictions with a trained model
         """
@@ -239,6 +258,19 @@ class LesionLocatorSegmenter(object):
         self.missing_modality_robust = bool(missing_modality_robust) and self.intermediate_fusion_mode
         self.fusion_arch = fusion_arch
         self.first_conv_key = None
+        # Measurement-only override: force every case's forward to drop a
+        # modality (Phase 6 "Job A" — quantifying robustness on a dataset that
+        # still has BOTH files on disk). Distinct from Phase 7's per-case
+        # auto-detected inference_modality (set from real missing files, see
+        # the per-case prediction loop below and _group_input_files_by_case).
+        if force_inference_modality is not None and not self.missing_modality_robust:
+            raise ValueError(
+                "--force_inference_modality requires a missing_modality_robust "
+                "checkpoint (got missing_modality_robust="
+                f"{self.missing_modality_robust}). This checkpoint has no "
+                "single-modality inference code path."
+            )
+        self.force_inference_modality = force_inference_modality
         if self.petct_mode:
             dataset_json = dict(dataset_json)
             dataset_json['channel_names'] = {'0': 'CT', '1': 'PET'}
@@ -487,9 +519,15 @@ class LesionLocatorSegmenter(object):
         if os.path.isdir(source_folder_or_file):
             assert os.path.isdir(prompt_folder_or_file), \
                 "If '-i' is a folder then '-p' (prompt) must also be a folder."
-            # Group input files by case (each element is a list of channel files)
-            input_files = self._group_input_files_by_case(
+            # Group input files by case. Each element is (file_group, inference_modality):
+            # inference_modality is None (both present / non-petct) or 'ct'/'pet'
+            # for a per-case auto-detected dropped modality (Phase 7; only
+            # possible against a missing_modality_robust checkpoint — see
+            # _group_input_files_by_case).
+            input_files_grouped = self._group_input_files_by_case(
                 source_folder_or_file, _file_ending, _num_modalities)
+            input_files = [g for g, _ in input_files_grouped]
+            inference_modalities = [m for _, m in input_files_grouped]
             prompt_files_json = subfiles(prompt_folder_or_file, suffix='.json', join=True, sort=True)
             prompt_files_mask = subfiles(prompt_folder_or_file, suffix=_file_ending, join=True, sort=True)
 
@@ -518,6 +556,7 @@ class LesionLocatorSegmenter(object):
                 input_files = [input_files[i] for i in not_existing_indices]
                 prompt_files = [prompt_files[i] for i in not_existing_indices]
                 output_files = [output_files[i] for i in not_existing_indices]
+                inference_modalities = [inference_modalities[i] for i in not_existing_indices]
 
         else:
             assert not os.path.isdir(prompt_folder_or_file), \
@@ -530,6 +569,7 @@ class LesionLocatorSegmenter(object):
             input_files = [[source_folder_or_file]]
             prompt_files = [prompt_folder_or_file]
             output_files = [join(output_folder_or_file, os.path.basename(source_folder_or_file))]
+            inference_modalities = [None]
 
         # indices = [j for j, i in enumerate(input_files) if 'TP0' not in os.path.basename(i)]
         # input_files = [input_files[i] for i in indices]
@@ -544,7 +584,7 @@ class LesionLocatorSegmenter(object):
         data_iterator = preprocessing_iterator_fromfiles(input_files, prompt_files,
                                                 output_files, prompt_type, self.plans_manager, self.dataset_json,
                                                 self.configuration_manager, num_processes_preprocessing, self.device.type == 'cuda',
-                                                self.verbose_preprocessing, self.track)
+                                                self.verbose_preprocessing, self.track, inference_modalities)
         print('Number of input files after part selection: ', len(input_files))
         return self.predict_from_data_iterator(data_iterator, prompt_type, output_folder_or_file, num_processes_segmentation_export)
 
@@ -635,6 +675,27 @@ class LesionLocatorSegmenter(object):
                 properties = preprocessed['data_properties']
                 prompt = preprocessed['prompt']
                 seg_mask = preprocessed['seg']
+
+                # Per-case single-modality inference: Phase 7 auto-detects a
+                # missing file at grouping time and tags the case (see
+                # _group_input_files_by_case / data_iterators.py's 'inference_modality'
+                # item key); Phase 6's --force_inference_modality overrides every
+                # case for measurement runs where both files are actually present.
+                # A non-robust checkpoint has no code path for a dropped modality,
+                # so a tagged case is a hard error rather than a silent full-fusion
+                # fallback.
+                case_inference_modality = preprocessed.get('inference_modality', None)
+                if self.force_inference_modality is not None:
+                    case_inference_modality = self.force_inference_modality
+                if case_inference_modality is not None and not self.missing_modality_robust:
+                    raise ValueError(
+                        f"Case {os.path.basename(ofile)} requires single-modality "
+                        f"inference (inference_modality={case_inference_modality}) "
+                        "but the loaded checkpoint is not missing_modality_robust."
+                    )
+                if self.missing_modality_robust:
+                    self._resolve_network_module().inference_modality = case_inference_modality
+
                 # let's not get into a runaway situation where the GPU predicts so fast that the disk has to b swamped with files
                 proceed = not check_workers_alive_and_busy(export_pool, worker_list, r, allowed_num_queued=2)
                 while not proceed:
@@ -1443,6 +1504,14 @@ def segment_and_track():
                         help="Only used with --modality petct and --fusion_arch weighted/mcsa. Set this if "
                              "the checkpoint was trained with the ShaSpec-inspired missing-modality "
                              "robustness add-on. Auto-detected from the checkpoint if omitted.")
+    parser.add_argument('--force_inference_modality', type=str, required=False, default=None,
+                        choices=['ct', 'pet'],
+                        help="Measurement-only override: force EVERY case's forward pass to drop the "
+                             "other modality, even if both _0000/_0001 files are present on disk. Use "
+                             "this to quantify robustness on a paired dataset (compare Dice at "
+                             "'ct'/'pet'/unset). Requires --missing_modality_robust. For real per-case "
+                             "missing files, leave this unset — the loader auto-detects which modality "
+                             "each case actually has.")
     parser.add_argument('--adaptive_mode', action='store_true', help='Enable selection between segmentation and tracking based on Dice/NSD scores.')
     parser.add_argument('--empty_prompt', action='store_true', help='Set this flag if you want to run the predictor with an empty prompt and will likely lead to worse performance.')
 
@@ -1495,7 +1564,8 @@ def segment_and_track():
     # checkpoint_folder_track = join(args.m, 'LesionLocatorSeg')
     predictor.initialize_from_trained_model_folder(checkpoint_folder, checkpoint_folder_track, args.f, args.modality, "checkpoint_final.pth",
                                                     fusion_arch=getattr(args, 'fusion_arch', None),
-                                                    missing_modality_robust=getattr(args, 'missing_modality_robust', False))
+                                                    missing_modality_robust=getattr(args, 'missing_modality_robust', False),
+                                                    force_inference_modality=getattr(args, 'force_inference_modality', None))
     predictor.predict_from_files(args.i, args.o, args.p, args.t,
                                  overwrite=not args.continue_prediction,
                                  num_processes_preprocessing=args.npp,

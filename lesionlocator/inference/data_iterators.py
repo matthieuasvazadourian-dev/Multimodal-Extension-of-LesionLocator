@@ -33,7 +33,8 @@ def preprocess_fromfiles_save_to_queue(input_files: List[str],
                                        done_event: Event,
                                        abort_event: Event,
                                        verbose: bool = False,
-                                       track: bool = False):
+                                       track: bool = False,
+                                       inference_modalities: List = None):
     try:
         preprocessor = configuration_manager.preprocessor_class(verbose=verbose)
         for idx in range(len(input_files)):
@@ -66,7 +67,12 @@ def preprocess_fromfiles_save_to_queue(input_files: List[str],
                 prompt = get_prompt_from_inst_or_bin_seg(seg, prompt_type)
             data = torch.from_numpy(data).to(dtype=torch.float32, memory_format=torch.contiguous_format)
 
-            item = {'data': data, 'prompt': prompt, 'seg':seg, 'data_properties': data_properties, 'ofile': output_files[idx], 'bl_data': bl_data, 'bl_data_properties': bl_data_properties}
+            # Per-case single-modality tag (Phase 7 auto-detect): None (both
+            # present), 'ct', or 'pet' — set by _group_input_files_by_case when
+            # a channel file was genuinely absent. Read by the main prediction
+            # loop to set network.inference_modality before the forward pass.
+            _inference_modality = inference_modalities[idx] if inference_modalities is not None else None
+            item = {'data': data, 'prompt': prompt, 'seg':seg, 'data_properties': data_properties, 'ofile': output_files[idx], 'bl_data': bl_data, 'bl_data_properties': bl_data_properties, 'inference_modality': _inference_modality}
             success = False
             print(f'Putting preprocessed item {idx+1}/{len(input_files)} into the queue...', flush=True)
             while not success:
@@ -94,11 +100,17 @@ def preprocessing_iterator_fromfiles(input_files: List[str],
                                      num_processes: int,
                                      pin_memory: bool = False,
                                      verbose: bool = False,
-                                     track: bool = False):
+                                     track: bool = False,
+                                     inference_modalities: List = None):
     context = multiprocessing.get_context('spawn')
     manager = Manager()
     num_processes = min(len(input_files), num_processes)
     assert num_processes >= 1
+    # Per-case modality tags (Phase 7), sliced identically to input_files/
+    # prompt_files/output_files so index idx in a worker's slice always lines
+    # up with the same case across all four lists.
+    if inference_modalities is None:
+        inference_modalities = [None] * len(input_files)
     processes = []
     done_events = []
     target_queues = []
@@ -119,7 +131,8 @@ def preprocessing_iterator_fromfiles(input_files: List[str],
                          event,
                          abort_event,
                          verbose,
-                         track
+                         track,
+                         inference_modalities[i::num_processes]
                      ), daemon=True)
         pr.start()
         target_queues.append(queue)
