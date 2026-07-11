@@ -160,10 +160,11 @@ class LesionLocatorSegmenter(object):
         return self.network._orig_mod if isinstance(self.network, OptimizedModule) else self.network
 
     def _group_input_files_by_case(self, source_folder: str, file_ending: str, num_modalities: int) -> list:
-        """Return a list of (file_group, inference_modality) pairs.
+        """Return a list of (case_id, file_group, inference_modality) triples.
 
         For single-modality datasets each file_group is a one-element list
-        [file] and inference_modality is always None.
+        [file], inference_modality is always None, and case_id is the
+        filename stem (unchanged naming behaviour from before this existed).
 
         For petct (num_modalities == 2, CT=channel 0, PET=channel 1): when
         both _0000/_0001 exist for a case, file_group is [ct_file, pet_file]
@@ -181,10 +182,18 @@ class LesionLocatorSegmenter(object):
         a dropped modality, so a missing file is a hard error in that case
         (this used to be an unchecked crash inside read_images; now it fails
         fast with a clear message before preprocessing even starts).
+
+        case_id is returned explicitly rather than left for the caller to
+        derive from file_group[0]'s filename, so output naming/resume
+        bookkeeping stays stable even if a case's modality composition
+        changes between runs — see group_petct_cases_by_modality's docstring.
         """
         all_files = subfiles(source_folder, suffix=file_ending, join=True, sort=True)
         if num_modalities == 1:
-            return [([f], None) for f in all_files]
+            return [(os.path.basename(f)[:-len(file_ending)], [f], None) for f in all_files]
+        # LesionLocator only ships 1- or 2-channel (CT+PET) configs today;
+        # a genuine 3+-channel non-petct dataset would need this function
+        # extended rather than silently mis-grouped by _0000/_0001 alone.
         assert num_modalities == 2, (
             f"Per-case modality auto-detection only supports CT+PET (2 channels), got num_modalities={num_modalities}."
         )
@@ -519,26 +528,39 @@ class LesionLocatorSegmenter(object):
         if os.path.isdir(source_folder_or_file):
             assert os.path.isdir(prompt_folder_or_file), \
                 "If '-i' is a folder then '-p' (prompt) must also be a folder."
-            # Group input files by case. Each element is (file_group, inference_modality):
-            # inference_modality is None (both present / non-petct) or 'ct'/'pet'
-            # for a per-case auto-detected dropped modality (Phase 7; only
-            # possible against a missing_modality_robust checkpoint — see
-            # _group_input_files_by_case).
+            # Group input files by case. Each element is (case_id, file_group,
+            # inference_modality): inference_modality is None (both present /
+            # non-petct) or 'ct'/'pet' for a per-case auto-detected dropped
+            # modality (Phase 7; only possible against a missing_modality_robust
+            # checkpoint — see _group_input_files_by_case). case_id is used
+            # directly for output naming/resume matching below (NOT derived
+            # from file_group[0]'s filename) so a case's identity in the
+            # output folder stays stable even if its modality composition
+            # changes between runs -- see group_petct_cases_by_modality's
+            # docstring for the concrete failure this avoids.
             input_files_grouped = self._group_input_files_by_case(
                 source_folder_or_file, _file_ending, _num_modalities)
-            input_files = [g for g, _ in input_files_grouped]
-            inference_modalities = [m for _, m in input_files_grouped]
+            case_ids = [c for c, _, _ in input_files_grouped]
+            input_files = [g for _, g, _ in input_files_grouped]
+            inference_modalities = [m for _, _, m in input_files_grouped]
             prompt_files_json = subfiles(prompt_folder_or_file, suffix='.json', join=True, sort=True)
             prompt_files_mask = subfiles(prompt_folder_or_file, suffix=_file_ending, join=True, sort=True)
 
-            output_basenames = ['_'.join(os.path.basename(group[0]).split('.')[0].split('_')[:3]) for group in input_files]
+            output_basenames = case_ids
             output_files = [join(output_folder_or_file, name) for name in output_basenames]
 
             if not os.path.isdir(output_folder_or_file):
                 os.makedirs(output_folder_or_file)
+            # Predicted files are named "<case_id>_lesion_<inst_id>.nii.gz"
+            # (see out_file = ofile + f'_lesion_{inst_id}' below) -- split on
+            # the literal '_lesion_' separator to recover case_id, rather than
+            # counting underscore-tokens, since case_id itself may contain any
+            # number of underscores.
             finished_files = subfiles(output_folder_or_file, suffix=_file_ending, join=True, sort=True)
-            finished_output_files = ['_'.join(os.path.basename(i).split('.')[0].split('_')[:3]) for i in finished_files]
-            finished_output_files = set(finished_output_files)
+            finished_output_files = {
+                os.path.basename(i)[:-len(_file_ending)].split('_lesion_')[0]
+                for i in finished_files if '_lesion_' in os.path.basename(i)
+            }
 
             # Assertions
             if len(input_files) == 0:

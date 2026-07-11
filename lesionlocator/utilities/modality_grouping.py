@@ -31,18 +31,28 @@ from typing import List, Optional, Tuple
 
 def group_petct_cases_by_modality(all_files: List[str], source_folder: str,
                                   file_ending: str,
-                                  missing_modality_robust: bool) -> List[Tuple[List[str], Optional[str]]]:
-    """Group a flat file listing into per-case (file_group, inference_modality) pairs.
+                                  missing_modality_robust: bool) -> List[Tuple[str, List[str], Optional[str]]]:
+    """Group a flat file listing into per-case (case_id, file_group, inference_modality) triples.
 
     `all_files` is every image file in `source_folder` (as produced by
     `subfiles(source_folder, suffix=file_ending, join=True)`). CT is channel 0
     (`_0000`), PET is channel 1 (`_0001`) — the convention used throughout this
     project (dataset_json channel_names, `route_by_modality.py`).
 
+    `case_id` is returned explicitly (rather than making callers reverse-engineer
+    it from `file_group[0]`'s filename) so output naming/resume bookkeeping is
+    invariant to *which* modality happened to be present for a case — deriving
+    it from file_group[0] instead would make a case's output basename silently
+    change if it gained/lost a modality between runs, breaking
+    --continue_prediction (concretely: a case first run CT-only, whose PET file
+    later appears, must be recognized as the *same case* needing a fusion
+    rerun, not treated as already-done just because file_group[0] happened to
+    stay the CT file both times).
+
     Returns one entry per case with both channels present or resolvable:
-    - both present: ([ct_file, pet_file], None)
-    - one missing, missing_modality_robust=True: ([x, x], 'ct'|'pet') where x
-      is the present file's path duplicated into both slots
+    - both present: (case_id, [ct_file, pet_file], None)
+    - one missing, missing_modality_robust=True: (case_id, [x, x], 'ct'|'pet')
+      where x is the present file's path duplicated into both slots
     - one missing, missing_modality_robust=False: raises ValueError — no
       inference code path exists for a dropped modality on that checkpoint
     - neither present for a detected case id (shouldn't normally happen since
@@ -61,7 +71,7 @@ def group_petct_cases_by_modality(all_files: List[str], source_folder: str,
         pet_file = os.path.join(source_folder, f'{case_id}_0001{file_ending}')
         has_ct, has_pet = os.path.isfile(ct_file), os.path.isfile(pet_file)
         if has_ct and has_pet:
-            groups.append(([ct_file, pet_file], None))
+            groups.append((case_id, [ct_file, pet_file], None))
         elif not missing_modality_robust:
             missing = 'PET (_0001)' if has_ct else 'CT (_0000)'
             raise ValueError(
@@ -72,9 +82,9 @@ def group_petct_cases_by_modality(all_files: List[str], source_folder: str,
                 "--missing_modality_robust."
             )
         elif has_ct:
-            groups.append(([ct_file, ct_file], 'ct'))
+            groups.append((case_id, [ct_file, ct_file], 'ct'))
         elif has_pet:
-            groups.append(([pet_file, pet_file], 'pet'))
+            groups.append((case_id, [pet_file, pet_file], 'pet'))
         else:
             print(f"[WARNING] Case '{case_id}' has neither CT nor PET file present — skipping.")
     return groups
