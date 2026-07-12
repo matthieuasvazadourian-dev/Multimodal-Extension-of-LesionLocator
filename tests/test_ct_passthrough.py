@@ -140,6 +140,77 @@ def test_missing_modality_training_forward(fusion_arch: str):
         assert torch.isfinite(model.last_aux_loss), f"Non-finite aux loss for has_ct={has_ct}, has_pet={has_pet}"
 
 
+# Sub-modules that participate in the forward/backward graph for EVERY
+# modality mask, per multimodal_unet.py's forward (lines 236-244) and
+# _compute_aux_loss (lines 250-302): fusion + both combiners always run
+# unconditionally each level, and the domain classifier always gets at
+# least one modality's logits appended.
+_ALWAYS_ACTIVE_PREFIXES = ('fusion_modules', 'combine_ct', 'combine_pet', 'domain_classifier')
+
+# Sub-modules whose participation is mask-dependent, per the same forward:
+# - specific_encoder_ct/pet only run when their own modality is present
+#   (has_ct / has_pet) -- no gradient when absent is correct, not a bug.
+# - gen_ct substitutes CT's specific feature only in the PET-only case
+#   (has_ct=False), AND separately gets gradient in the both-present case
+#   via the detached-target aux reconstruction loss (_compute_aux_loss
+#   lines 288-295); it is never called at all in the CT-only case (the real
+#   specific_encoder_ct is used instead, and the aux gen term is skipped
+#   whenever not both-present). gen_pet is the mirror image.
+_MASK_ACTIVE_PREFIXES = {
+    (True, True):  ('specific_encoder_ct', 'specific_encoder_pet', 'gen_ct', 'gen_pet'),
+    (False, True): ('specific_encoder_pet', 'gen_ct'),   # PET-only: gen_ct substitutes CT
+    (True, False): ('specific_encoder_ct', 'gen_pet'),   # CT-only: gen_pet substitutes PET
+}
+
+
+@pytest.mark.parametrize("fusion_arch", ["weighted", "mcsa"])
+def test_missing_modality_training_backward(fusion_arch: str):
+    """
+    Gradient-connectivity check for the missing-modality training path --
+    the one thing test_missing_modality_training_forward can't see. A
+    detached cross-attention branch or a dead aux-loss term would still
+    produce a finite forward output and a finite last_aux_loss, but
+    silently fail to train. Never previously tested for mcsa (or weighted)
+    anywhere in this codebase -- only forward numerics were verified before
+    this test.
+    """
+    torch.manual_seed(0)
+    model = _build_fusion(fusion_arch, missing_modality_robust=True)
+    model.train()
+
+    def _params_with_prefix(*prefixes):
+        return {
+            name: p for name, p in model.named_parameters()
+            if any(name.startswith(pre) for pre in prefixes) and p.requires_grad
+        }
+
+    always_active = _params_with_prefix(*_ALWAYS_ACTIVE_PREFIXES)
+    assert always_active, "No always-active fusion/ShaSpec parameters found -- check prefixes"
+
+    x = torch.randn(1, 3, _PATCH_D, _PATCH_H, _PATCH_W)
+
+    for (has_ct, has_pet), mask_prefixes in _MASK_ACTIVE_PREFIXES.items():
+        model.zero_grad(set_to_none=True)
+        model._resolve_modality_mask = lambda hc=has_ct, hp=has_pet: (hc, hp)
+        out = model(x)
+        loss = out.mean() + model.last_aux_loss
+        loss.backward()
+
+        expected_active = dict(always_active)
+        expected_active.update(_params_with_prefix(*mask_prefixes))
+
+        missing_grad = [name for name, p in expected_active.items() if p.grad is None]
+        assert not missing_grad, (
+            f"fusion_arch='{fusion_arch}', has_ct={has_ct}, has_pet={has_pet}: "
+            f"expected-active parameter(s) got no gradient: {missing_grad}"
+        )
+        non_finite = [name for name, p in expected_active.items() if not torch.isfinite(p.grad).all()]
+        assert not non_finite, (
+            f"fusion_arch='{fusion_arch}', has_ct={has_ct}, has_pet={has_pet}: "
+            f"non-finite gradient: {non_finite}"
+        )
+
+
 @pytest.mark.parametrize("fusion_arch", ["weighted", "mcsa"])
 def test_missing_modality_eval_forward(fusion_arch: str):
     """
