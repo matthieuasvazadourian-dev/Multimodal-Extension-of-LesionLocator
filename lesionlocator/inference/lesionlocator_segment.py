@@ -430,6 +430,12 @@ class LesionLocatorSegmenter(object):
                     prompt_files = [prompt_files[i] for i in not_existing_indices]
                     output_files = [output_files[i] for i in not_existing_indices]
                     inference_modalities = [inference_modalities[i] for i in not_existing_indices]
+                    if len(input_files) == 0:
+                        # preprocessing_iterator_fromfiles does min(len(input_files), num_processes)
+                        # then asserts num_processes >= 1 -- an empty post-filter list (everything
+                        # already finished) would otherwise crash there instead of being a no-op.
+                        print(f'All {len(case_ids)} case(s) already finished (--continue_prediction). Nothing to do.')
+                        return
         else:
             assert not os.path.isdir(prompt_folder_or_file), \
                 "If '-i' is a file then '-p' (prompt) must also be files not folders."
