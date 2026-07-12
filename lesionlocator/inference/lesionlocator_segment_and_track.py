@@ -970,20 +970,15 @@ class LesionLocatorSegmenter(object):
                         # # if low_score and not self.adaptive_mode:
                         #     out_file += '_tracked_failed'
 
-                        # # save predict nii.gz
-                        # if 'prediction' in locals():
-                        #     r.append(
-                        #         export_pool.starmap_async(
-                        #             export_prediction_from_logits,
-                        #             ((prediction, properties, self.configuration_manager, self.plans_manager,
-                        #                 self.dataset_json, out_file, False),)
-                        #         )
-                        #     )
-                            
-
-                        # no multiprocessing
-                        # export_prediction_from_logits(prediction, properties, self.configuration_manager, self.plans_manager,
-                        #     self.dataset_json, out_file, False)
+                        # save predict nii.gz
+                        if 'prediction' in locals():
+                            r.append(
+                                export_pool.starmap_async(
+                                    export_prediction_from_logits,
+                                    ((prediction, properties, self.configuration_manager, self.plans_manager,
+                                        self.dataset_json, out_file, False),)
+                                )
+                            )
                     for metric_name in metrics.keys():
                         error_all[metric_name][patient_tp]['mean'] = np.mean(error_all[metric_name][patient_tp]['per_lesion'])
                 print(f'done with {os.path.basename(ofile)}')
