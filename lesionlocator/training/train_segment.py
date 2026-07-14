@@ -125,6 +125,27 @@ def _raise_if_fatal_worker_error(error: Exception, phase: str, batch_idx: int, d
         ) from error
 
 
+def _is_training_diverged_error(error: Exception) -> bool:
+    # Matches the RuntimeErrors raised by this file's own fail-fast checks
+    # (non-finite loss, GradScaler step-skip streak -- see train_cv_fold).
+    # These mean training has genuinely diverged, not hit a transient/
+    # retryable failure, so they must abort immediately rather than being
+    # absorbed into the generic consecutive-same-error-class abort-streak
+    # logic below (which would still eventually catch it after up to 10
+    # retried batches, but with a less specific top-level error message).
+    message = str(error)
+    return any(token in message for token in (
+        'Non-finite loss',
+        'consecutive GradScaler step-skips',
+    ))
+
+
+def _raise_if_training_diverged(error: Exception, phase: str, batch_idx: int):
+    if _is_training_diverged_error(error):
+        print(f"Fatal training-divergence error in {phase} batch {batch_idx}; aborting this run.")
+        raise error
+
+
 def _safe_mean(values) -> float:
     return float(np.mean(values)) if len(values) > 0 else 0.0
 
@@ -461,9 +482,22 @@ def _is_high_lr_fusion_param(name: str) -> bool:
     a pretrained backbone at lr risks destabilizing training once the
     zero-init SharedSpecificCombiner gate opens. They still get force-trainable
     status and train at the base backbone LR.
+
+    Also excludes MCSA's attention projections (BDSABlock.proj_q/proj_k/proj_v):
+    these are standard random-init 1x1x1 convs, not near-zero-init adapters
+    either, and are a much larger block (~33.5M params) than the tiny
+    alpha/mixer gates the 10x bump was designed for. Training this block at
+    10x LR alongside a single global gradient-clip norm was found to drive
+    real training divergence (validation loss climbing monotonically while
+    the level-0 weighted-style gate collapsed to exactly 0) -- see
+    tests/test_fusion_stability.py. The substring match is unambiguous:
+    proj_q/proj_k/proj_v only ever appear on BDSABlock's own projections;
+    MCSAFusionWrapper's separate zero-init outer gate is named `proj` (an
+    nn.Sequential, parameter names proj.0.*/proj.1.*), which does not match.
     """
     return _is_intermediate_fusion_param(name) and not (
         'specific_encoder_ct' in name or 'specific_encoder_pet' in name
+        or 'proj_q' in name or 'proj_k' in name or 'proj_v' in name
     )
 
 
@@ -1634,8 +1668,11 @@ class LesionLocatorSegmenter(object):
             )
         self.trainable_params = trainable_params  # stored for grad clipping
 
-        # Setup optimizer: intermediate fusion uses a separate higher lr for fusion modules
-        # so α_pet (init 0) has enough signal to move away from zero.
+        # Setup optimizer: intermediate fusion uses a separate higher lr for the
+        # near-zero-init fusion gates so α_pet (init 0) has enough signal to
+        # move away from zero. MCSA's attention projections (proj_q/k/v) are
+        # NOT near-zero-init and stay in the base-lr backbone group -- see
+        # _is_high_lr_fusion_param's docstring.
         if getattr(self, 'intermediate_fusion_mode', False):
             fusion_params   = [p for n, p in self.network.named_parameters()
                                if p.requires_grad and _is_high_lr_fusion_param(n)]
@@ -1646,7 +1683,9 @@ class LesionLocatorSegmenter(object):
                  {'params': fusion_params,   'lr': learning_rate * 10}],
                 weight_decay=weight_decay
             )
-            print(f'[intermediate-fusion] Optimizer: backbone lr={learning_rate}, fusion lr={learning_rate * 10}')
+            print(f'[intermediate-fusion] Optimizer: backbone lr={learning_rate} '
+                  f'({sum(p.numel() for p in backbone_params):,} params), '
+                  f'fusion lr={learning_rate * 10} ({sum(p.numel() for p in fusion_params):,} params)')
         else:
             self.optimizer = optim.Adam(trainable_params, lr=learning_rate, weight_decay=weight_decay)
 
@@ -1881,8 +1920,18 @@ class LesionLocatorSegmenter(object):
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
         plt.close()
 
-    def _log_fusion_module_stats(self):
-        """Log per-level fusion module diagnostics (α-values for Weighted, mixer norms for MCSA)."""
+    def _log_fusion_module_stats(self, avg_grad_norms=None):
+        """Log per-level fusion module diagnostics (α-values for Weighted, mixer norms for MCSA).
+
+        avg_grad_norms: optional list of this epoch's mean per-param-group
+        gradient norm (one entry per self.optimizer.param_groups entry, same
+        order: backbone group first, then fusion-gates group). Printed
+        alongside the per-level diagnostics so a diverging group is visible
+        right next to the α/mixer values it's driving -- see A4.
+        """
+        if avg_grad_norms is not None:
+            norms_str = ', '.join(f'group{i}={n:.4f}' for i, n in enumerate(avg_grad_norms))
+            print(f'  [fusion] avg grad norm this epoch: {norms_str}')
         net = self.network._orig_mod if isinstance(self.network, OptimizedModule) else self.network
         if not hasattr(net, 'fusion_modules'):
             return
@@ -2181,6 +2230,13 @@ class LesionLocatorSegmenter(object):
             self.network.train()
             epoch_train_loss = torch.zeros(1, device=device)
             num_train_batches = 0
+            # A4: running per-param-group grad-norm sum, averaged and logged
+            # once per epoch alongside _log_fusion_module_stats' α/mixer
+            # diagnostics -- the single most useful missing signal from the
+            # diverged mcsa+robust run (the attention group's norm would have
+            # shown a clear diverging trend while the old diluted global norm
+            # stayed under the 12.0 clip threshold the whole time).
+            epoch_grad_norm_sum = None
 
             print(f"\nFold {fold_idx}, Epoch {epoch+1}/{epochs}")
             print("Training...")
@@ -2188,6 +2244,7 @@ class LesionLocatorSegmenter(object):
             _train_dl_iter = enumerate(train_dataloader)
             _train_consec_fail = 0
             _train_last_err_cls = None
+            _train_consec_scale_skip = 0
             while True:
                 try:
                     batch_idx, batch = next(_train_dl_iter)
@@ -2214,28 +2271,68 @@ class LesionLocatorSegmenter(object):
                         outputs = self.network(combined_input)
                         loss = self.loss_function(outputs, target)
 
+                    # A1: fail fast on a non-finite loss instead of silently
+                    # backpropagating NaN/Inf. Nothing downstream (backward,
+                    # optimizer.step, the abort-streak guard below, which only
+                    # catches Python exceptions) can detect this on its own --
+                    # a diverging run would otherwise hang silently for hours
+                    # rather than failing immediately with actionable context.
+                    if not torch.isfinite(loss.detach()):
+                        raise RuntimeError(
+                            f"Non-finite loss ({loss.detach().item()}) at epoch {epoch+1}, "
+                            f"batch {batch_idx} (scaler scale={self.scaler.get_scale()})."
+                        )
+
                     self.scaler.scale(loss).backward()
                     self.scaler.unscale_(self.optimizer)
-                    torch.nn.utils.clip_grad_norm_(
-                        [p for group in self.optimizer.param_groups for p in group['params']],
-                        max_norm=12.0
-                    )
+                    # B3: clip each param group independently rather than one
+                    # global norm over all groups concatenated. A single
+                    # global norm lets a gradient spike localized to one group
+                    # (e.g. MCSA's attention block) hide inside the diluted
+                    # combined norm, survive clipping, then get amplified by
+                    # that group's own LR multiplier.
+                    grad_norms = [
+                        torch.nn.utils.clip_grad_norm_(group['params'], max_norm=12.0).item()
+                        for group in self.optimizer.param_groups
+                    ]
+                    scale_before = self.scaler.get_scale()
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
+                    scale_after = self.scaler.get_scale()
+                    # A2: a scale decrease means GradScaler silently skipped
+                    # this optimizer step because it found inf/nan gradients
+                    # -- otherwise completely invisible. Track consecutive
+                    # skips and abort past a threshold.
+                    if scale_after < scale_before:
+                        _train_consec_scale_skip += 1
+                        if _train_consec_scale_skip >= 25:
+                            raise RuntimeError(
+                                f"{_train_consec_scale_skip} consecutive GradScaler step-skips "
+                                f"(inf/nan gradients) at epoch {epoch+1}, batch {batch_idx} "
+                                "— aborting fold."
+                            )
+                    else:
+                        _train_consec_scale_skip = 0
 
                     epoch_train_loss += loss.detach()
                     num_train_batches += 1
+                    if epoch_grad_norm_sum is None:
+                        epoch_grad_norm_sum = [0.0] * len(grad_norms)
+                    epoch_grad_norm_sum = [s + g for s, g in zip(epoch_grad_norm_sum, grad_norms)]
                     _train_consec_fail = 0
                     _train_last_err_cls = None
 
                     if batch_idx % 10 == 0:
                         # .item() syncs GPU — only pay this cost every 10 batches
-                        print(f"  Batch {batch_idx}, Loss: {loss.detach().item():.4f}")
+                        norms_str = ', '.join(f'{g:.2f}' for g in grad_norms)
+                        print(f"  Batch {batch_idx}, Loss: {loss.detach().item():.4f}  "
+                              f"grad_norms=[{norms_str}]  scaler_scale={scale_after:.0f}")
 
                     del data, prompt, target, combined_input, outputs, loss
 
                 except Exception as e:
                     print(f"Error in training batch {batch_idx}: {e}")
+                    _raise_if_training_diverged(e, 'training', batch_idx)
                     _raise_if_fatal_cuda_error(e, 'training', batch_idx, device)
                     _raise_if_fatal_worker_error(e, 'training', batch_idx, device)
                     _maybe_empty_cache(device)
@@ -2406,7 +2503,11 @@ class LesionLocatorSegmenter(object):
 
             # Log fusion module stats (α-values / mixer norms) every epoch
             if getattr(self, 'intermediate_fusion_mode', False):
-                self._log_fusion_module_stats()
+                avg_grad_norms = (
+                    [s / num_train_batches for s in epoch_grad_norm_sum]
+                    if epoch_grad_norm_sum is not None and num_train_batches > 0 else None
+                )
+                self._log_fusion_module_stats(avg_grad_norms)
 
             fold_folder = os.path.join(output_folder, f'fold_{fold_idx}') if output_folder else None
 
@@ -2533,21 +2634,33 @@ class LesionLocatorSegmenter(object):
                     
                     # Calculate loss
                     loss = self.loss_function(outputs, target)
-                    
+
+                    # A6: fail fast on a non-finite loss. This legacy loop
+                    # has no AMP scaler and no other safeguard at all --
+                    # without this it would silently backprop NaN/Inf, the
+                    # same way the diverged mcsa+robust run did in the
+                    # (separately guarded) train_cv_fold loop.
+                    if not torch.isfinite(loss.detach()):
+                        raise RuntimeError(
+                            f"Non-finite loss ({loss.detach().item()}) at epoch {epoch+1}, "
+                            f"batch {batch_idx}."
+                        )
+
                     # Backward pass
                     loss.backward()
                     self.optimizer.step()
-                    
+
                     # Update metrics
                     epoch_train_loss += loss.item()
                     num_train_batches += 1
-                    
+
                     if batch_idx % 10 == 0:
                         batch_size_actual = data.shape[0]
                         print(f"  Batch {batch_idx} (size={batch_size_actual}), Loss: {loss.item():.4f}")
-                        
+
                 except Exception as e:
                     print(f"Error in training batch {batch_idx}: {e}")
+                    _raise_if_training_diverged(e, 'training', batch_idx)
                     _raise_if_fatal_cuda_error(e, 'training', batch_idx, device)
                     import traceback
                     traceback.print_exc()

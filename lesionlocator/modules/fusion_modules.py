@@ -129,6 +129,21 @@ class BDSABlock(nn.Module):
         self.proj_v = nn.Conv3d(C, C, kernel_size=1, bias=False)
         self.mixer  = nn.Conv3d(2 * C, C, kernel_size=3, padding=1, bias=False)
         self.scale  = C ** -0.5
+        # Bound attention-input magnitude before Q/K/V projection. Attention
+        # logit magnitude scales as ~sqrt(C)*v^2 (v = input feature magnitude)
+        # -- the 1/sqrt(C) scale above corrects the C-dependence but not the
+        # quadratic dependence on v. Under the ShaSpec missing-modality
+        # add-on, x_ct/x_pet come from SharedSpecificCombiner, which is
+        # unnormalized and can grow unboundedly over training steps; without
+        # a norm here, growing inputs push softmax toward one-hot, producing
+        # vanishing/exploding gradients through the softmax Jacobian.
+        # Separate per-modality instances, consistent with combine_ct/pet
+        # already being separate per-modality modules. Sits upstream of the
+        # zero-init mixer below, so it cannot affect CT-passthrough at init
+        # (mixer's zero weights force its output to exactly 0 regardless of
+        # what this normalization produces).
+        self.norm_ct  = nn.GroupNorm(min(32, C), C, affine=True)
+        self.norm_pet = nn.GroupNorm(min(32, C), C, affine=True)
         # mixer near-zero init -> enhanced feature ≈ 0, residual carries signal
         nn.init.zeros_(self.mixer.weight)
 
@@ -178,12 +193,20 @@ class BDSABlock(nn.Module):
         Returns DELTA tensors (attention output only, no residual).
         MCSAFusion.forward adds the single outer residual.
         """
+        # Normalize once per forward (not inside _attend, which runs twice
+        # per forward -- once per source/target role -- to avoid duplicating
+        # the norm computation for the same two input tensors). No explicit
+        # dtype cast needed here: _attend does its own .float() cast on
+        # entry regardless of what dtype GroupNorm produces under AMP.
+        x_ct_n  = self.norm_ct(x_ct)
+        x_pet_n = self.norm_pet(x_pet)
+
         # PET -> CT: CT is target, PET is source
-        A_cross_ct, A_self_ct = self._attend(source=x_pet, target=x_ct)
+        A_cross_ct, A_self_ct = self._attend(source=x_pet_n, target=x_ct_n)
         e_ct  = self.mixer(torch.cat([A_cross_ct, A_self_ct], dim=1))
 
         # CT -> PET: PET is target, CT is source
-        A_cross_pet, A_self_pet = self._attend(source=x_ct, target=x_pet)
+        A_cross_pet, A_self_pet = self._attend(source=x_ct_n, target=x_pet_n)
         e_pet = self.mixer(torch.cat([A_cross_pet, A_self_pet], dim=1))
 
         return e_ct, e_pet
