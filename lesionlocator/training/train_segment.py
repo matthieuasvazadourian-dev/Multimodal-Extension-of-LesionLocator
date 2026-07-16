@@ -5,6 +5,8 @@ import gc
 import traceback
 import json
 import time
+import faulthandler
+import signal
 import numpy as np
 from queue import Queue
 from threading import Thread
@@ -2357,54 +2359,77 @@ class LesionLocatorSegmenter(object):
             num_val_batches = 0
 
             print("Validating (loss computation on CV fold)...")
-            with torch.inference_mode():
-                _val_dl_iter = enumerate(val_dataloader)
-                _val_consec_fail = 0
-                _val_last_err_cls = None
-                while True:
-                    try:
-                        batch_idx, batch = next(_val_dl_iter)
-                    except StopIteration:
-                        break
-                    except Exception as e:
-                        _raise_if_fatal_worker_error(e, 'validation-iterator', -1, device)
-                        raise
-                    try:
-                        data = batch['data'].to(device, non_blocking=True)
-                        prompt = batch['prompt'].to(device, dtype=data.dtype, non_blocking=True)
-                        target = batch['target'].to(device, non_blocking=True)
+            # Hang diagnostics: this phase has previously hung silently (no
+            # exception, GPU idle) with no indication of where. If validation
+            # makes no progress for 600s, auto-dump every thread's live stack
+            # (works even if the main thread is blocked in a C-level CUDA
+            # sync holding the GIL) so a recurrence is diagnosable from the
+            # log instead of another multi-hour silent mystery. Armed only
+            # around this phase (via try/finally) so normal training epochs
+            # produce no spurious dumps.
+            faulthandler.dump_traceback_later(600, repeat=True)
+            try:
+                with torch.inference_mode():
+                    _val_dl_iter = enumerate(val_dataloader)
+                    _val_consec_fail = 0
+                    _val_last_err_cls = None
+                    while True:
+                        try:
+                            batch_idx, batch = next(_val_dl_iter)
+                        except StopIteration:
+                            break
+                        except Exception as e:
+                            _raise_if_fatal_worker_error(e, 'validation-iterator', -1, device)
+                            raise
+                        try:
+                            data = batch['data'].to(device, non_blocking=True)
+                            prompt = batch['prompt'].to(device, dtype=data.dtype, non_blocking=True)
+                            target = batch['target'].to(device, non_blocking=True)
 
-                        if data.dim() == 4:
-                            data = data.unsqueeze(0)
-                            prompt = prompt.unsqueeze(0)
-                            target = target.unsqueeze(0)
+                            if data.dim() == 4:
+                                data = data.unsqueeze(0)
+                                prompt = prompt.unsqueeze(0)
+                                target = target.unsqueeze(0)
 
-                        combined_input = torch.cat([data, prompt], dim=1)
+                            combined_input = torch.cat([data, prompt], dim=1)
 
-                        with _autocast_context(device):
-                            outputs = self.network(combined_input)
-                            loss = self.loss_function(outputs, target)
+                            with _autocast_context(device):
+                                outputs = self.network(combined_input)
+                                loss = self.loss_function(outputs, target)
 
-                        epoch_val_loss += loss.detach()
-                        num_val_batches += 1
-                        _val_consec_fail = 0
-                        _val_last_err_cls = None
+                            # Forces a CUDA sync every batch (via .item()). Deliberately not
+                            # deferred to a periodic cadence like the training loop's every-10
+                            # print: CUDA kernel launches are async and nothing else in this
+                            # loop syncs, so without this a hung/stuck kernel on ANY batch would
+                            # let Python race through the rest of the loop instantly and only
+                            # block later, at the final avg_val_loss=(...).item() after the loop
+                            # -- making it impossible to tell which batch actually hung. Val set
+                            # is small (a few hundred samples/epoch) so the per-batch sync cost
+                            # here is negligible against real GPU compute time.
+                            print(f"  Val batch {batch_idx}, Loss: {loss.item():.4f}", flush=True)
 
-                        del data, prompt, target, combined_input, outputs, loss
+                            epoch_val_loss += loss.detach()
+                            num_val_batches += 1
+                            _val_consec_fail = 0
+                            _val_last_err_cls = None
 
-                    except Exception as e:
-                        print(f"Error in validation batch {batch_idx}: {e}")
-                        _raise_if_fatal_cuda_error(e, 'validation', batch_idx, device)
-                        _raise_if_fatal_worker_error(e, 'validation', batch_idx, device)
-                        _maybe_empty_cache(device)
-                        err_cls = type(e).__name__
-                        _val_consec_fail = _val_consec_fail + 1 if err_cls == _val_last_err_cls else 1
-                        _val_last_err_cls = err_cls
-                        if _val_consec_fail >= 10:
-                            raise RuntimeError(
-                                f"{_val_consec_fail} consecutive {err_cls} errors in validation — aborting fold."
-                            ) from e
-                        continue
+                            del data, prompt, target, combined_input, outputs, loss
+
+                        except Exception as e:
+                            print(f"Error in validation batch {batch_idx}: {e}")
+                            _raise_if_fatal_cuda_error(e, 'validation', batch_idx, device)
+                            _raise_if_fatal_worker_error(e, 'validation', batch_idx, device)
+                            _maybe_empty_cache(device)
+                            err_cls = type(e).__name__
+                            _val_consec_fail = _val_consec_fail + 1 if err_cls == _val_last_err_cls else 1
+                            _val_last_err_cls = err_cls
+                            if _val_consec_fail >= 10:
+                                raise RuntimeError(
+                                    f"{_val_consec_fail} consecutive {err_cls} errors in validation — aborting fold."
+                                ) from e
+                            continue
+            finally:
+                faulthandler.cancel_dump_traceback_later()
 
             avg_val_loss = (epoch_val_loss / max(num_val_batches, 1)).item()
             fold_val_losses.append(avg_val_loss)
@@ -2468,6 +2493,7 @@ class LesionLocatorSegmenter(object):
 
                                 dice_score = compute_dice_coefficient(target_cropped, pred_cropped)
                                 epoch_test_dice_scores.append(dice_score)
+                                print(f"  Test batch {batch_idx}, Dice: {dice_score:.4f}", flush=True)
 
                                 if self.visualize:
                                     if batch_idx < 1 and output_folder:
@@ -2888,6 +2914,15 @@ class LesionLocatorSegmenter(object):
 
 
 def train_from_prompt():
+    # Hang diagnostics: SIGUSR1 dumps every thread's live stack to stdout on
+    # demand (`kill -USR1 <pid>` from a shell in the same pod, e.g. via
+    # `runai workspace exec`), and works even if the main thread is blocked in
+    # a C-level call (e.g. a CUDA sync) holding the GIL. Zero overhead when
+    # not triggered -- registered unconditionally, independent of --device.
+    faulthandler.enable()
+    if hasattr(signal, 'SIGUSR1'):
+        faulthandler.register(signal.SIGUSR1)
+
     import argparse
     parser = argparse.ArgumentParser(description='This function handles the LesionLocator single timepoint segmentation'
                                      'training using a point or 3D box prompt. Prompts can be the coordinates of a '
