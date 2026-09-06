@@ -11,18 +11,18 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_ROOT"
 python -m pip install -e . --quiet
 
-FOLD=${1:?"Usage: $0 <fold> [empty_prompt]"}
-EMPTY_PROMPT=${2:-"False"}
+FOLD=${1:?"Usage: $0 <fold>"}
 
 # Paths — PET+CT dataset lives in home (paired _0000 CT and _0001 PET files)
 TEST_DATA=/home/masva/datasets/Dataset901_USZMelanomaPETCT/imagesTr
 TEST_PROMPT=/home/masva/datasets/Dataset901_USZMelanomaPETCT/labelsTr
-SEG_CKPT_ROOT=/home/masva/ckpt/TrainSeg900_PetCT_EarlyFusion
+SEG_CKPT_ROOT=/home/masva/ckpt/TrainSeg900_Intermediate_MCSA
 TRACK_CKPT_ROOT=/scratch/LesionLocator_saved_ckpt/TrainSeg800_LesionLocatorFTDec
 OUTPUT=/home/masva/vis_pet_track_eval/fold_$FOLD
 COMBINED_CKPT_ROOT="$OUTPUT/combined_ckpt_root"
+EMBEDDING_OUTPUT="$OUTPUT/embeddings"
 
-mkdir -p "$OUTPUT"
+mkdir -p "$OUTPUT" "$EMBEDDING_OUTPUT"
 
 export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:64
 export CUDA_VISIBLE_DEVICES=0
@@ -49,12 +49,6 @@ mkdir -p "$COMBINED_CKPT_ROOT"
 ln -sfn "$SEG_COMPONENT" "$COMBINED_CKPT_ROOT/LesionLocatorSeg"
 ln -sfn "$TRACK_COMPONENT" "$COMBINED_CKPT_ROOT/LesionLocatorTrack"
 
-if [ "$EMPTY_PROMPT" = "True" ]; then
-    ADAPTIVE_FLAGS="--adaptive_mode --empty_prompt"
-else
-    ADAPTIVE_FLAGS="--adaptive_mode"
-fi
-
 LesionLocator_track_embed \
   -i  $TEST_DATA \
   -p  $TEST_PROMPT \
@@ -64,8 +58,11 @@ LesionLocator_track_embed \
   -t  point \
   -npp 1 -nps 1 \
   --modality petct \
+  --fusion_arch mcsa \
   --track \
+  --adaptive_mode \
   --lesion_focus \
   --crop_size 64 \
-  $ADAPTIVE_FLAGS \
+  --extract_embeddings \
+  --embedding_output_folder "$EMBEDDING_OUTPUT" \
   2>&1 | tee "$OUTPUT/eval_track_pet_fold_$FOLD.txt"

@@ -23,6 +23,7 @@ import lesionlocator
 from lesionlocator.preprocessing.resampling.default_resampling import compute_new_shape
 from lesionlocator.configuration import default_num_processes
 from lesionlocator.inference.data_iterators import preprocessing_iterator_fromfiles
+from lesionlocator.utilities.modality_grouping import group_petct_cases_by_modality
 from lesionlocator.inference.export_prediction import export_prediction_from_logits
 from lesionlocator.inference.sliding_window_prediction import compute_gaussian, \
     compute_steps_for_sliding_window
@@ -191,6 +192,10 @@ class LesionLocatorSegmenter(object):
             print(f'Crop size: {self.crop_size}x{self.crop_size}x{self.crop_size}')
 
         self.petct_mode = False
+        self.intermediate_fusion_mode = False
+        self.missing_modality_robust = False
+        self.fusion_arch = None
+        self.force_inference_modality = None
         self.first_conv_key = None
 
     @staticmethod
@@ -234,28 +239,36 @@ class LesionLocatorSegmenter(object):
               f'{list(ref_shape)} -> {list(state_dict[extended[0]].shape)}')
         return state_dict
 
-    @staticmethod
-    def _group_input_files_by_case(source_folder: str, file_ending: str, num_modalities: int) -> list:
-        """Return a list of per-case channel groups."""
+    def _resolve_network_module(self):
+        """Unwrap torch.compile's OptimizedModule to reach the real nn.Module.
+        Setting inference_modality on the wrapper would NOT reach the wrapped module."""
+        return self.network._orig_mod if isinstance(self.network, OptimizedModule) else self.network
+
+    def _group_input_files_by_case(self, source_folder: str, file_ending: str, num_modalities: int) -> list:
+        """Return a list of (case_id, file_group, inference_modality) triples.
+
+        For single-modality datasets each file_group is a one-element list,
+        inference_modality is always None, and case_id is the filename stem.
+
+        For petct (num_modalities == 2): delegates to group_petct_cases_by_modality
+        which handles missing-modality-robust duplicate-slot filling.
+        """
         all_files = subfiles(source_folder, suffix=file_ending, join=True, sort=True)
         if num_modalities == 1:
-            return [[f] for f in all_files]
-        ct_files = sorted(f for f in all_files
-                          if os.path.basename(f).endswith('_0000' + file_ending))
-        groups = []
-        for ct_file in ct_files:
-            group = [ct_file]
-            for c in range(1, num_modalities):
-                other = ct_file.replace(f'_0000{file_ending}', f'_{c:04d}{file_ending}')
-                group.append(other)
-            groups.append(group)
-        return groups
+            return [(os.path.basename(f)[:-len(file_ending)], [f], None) for f in all_files]
+        assert num_modalities == 2, (
+            f"Per-case modality auto-detection only supports CT+PET (2 channels), got num_modalities={num_modalities}."
+        )
+        return group_petct_cases_by_modality(all_files, source_folder, file_ending, self.missing_modality_robust)
 
     def initialize_from_trained_model_folder(self, model_training_output_dir: str,
                                              model_track_training_output_dir: str,
                                              use_folds: Union[Tuple[Union[int, str]], None],
                                              modality: str = 'ct',
-                                             checkpoint_name: str = 'checkpoint_final.pth'):
+                                             checkpoint_name: str = 'checkpoint_final.pth',
+                                             fusion_arch: str = None,
+                                             missing_modality_robust: bool = False,
+                                             force_inference_modality: str = None):
         """
         This is used when making predictions with a trained model
         """
@@ -287,17 +300,46 @@ class LesionLocatorSegmenter(object):
                 configuration_name = checkpoint['init_args']['configuration']
                 inference_allowed_mirroring_axes = checkpoint['inference_allowed_mirroring_axes'] if \
                     'inference_allowed_mirroring_axes' in checkpoint.keys() else None
+                # Auto-detect fusion_arch from checkpoint when not provided via CLI
+                fusion_arch_from_ckpt = checkpoint.get('fusion_arch', None)
+                if fusion_arch_from_ckpt not in (None, 'weighted', 'mcsa'):
+                    raise ValueError(
+                        f"Checkpoint uses removed fusion_arch='{fusion_arch_from_ckpt}'. "
+                        f"Old TAMW/Combined/ShaSpec checkpoints are incompatible with current code. Retrain with --fusion_arch weighted or mcsa."
+                    )
+                if fusion_arch is None and fusion_arch_from_ckpt is not None:
+                    fusion_arch = fusion_arch_from_ckpt
+                    print(f'[intermediate-fusion] Auto-detected fusion_arch={fusion_arch} from checkpoint.')
+                elif fusion_arch is not None and fusion_arch_from_ckpt is not None and fusion_arch != fusion_arch_from_ckpt:
+                    raise ValueError(
+                        f'CLI --fusion_arch={fusion_arch} disagrees with checkpoint fusion_arch={fusion_arch_from_ckpt}'
+                    )
+                # Auto-detect missing_modality_robust from checkpoint when not requested via CLI
+                robust_from_ckpt = checkpoint.get('missing_modality_robust', False)
+                if not missing_modality_robust and robust_from_ckpt:
+                    missing_modality_robust = True
+                    print('[intermediate-fusion] Auto-detected missing_modality_robust=True from checkpoint.')
 
             parameters.append(checkpoint['network_weights'])
 
-        # PET+CT early-fusion: patch dataset_json so that num_input_channels = 2 and
-        # extend the first conv layer of each checkpoint to accept the extra PET channel.
+        # PET+CT: patch dataset_json so num_input_channels = 2 (both fusion modes).
         self.petct_mode = (modality == 'petct')
+        self.intermediate_fusion_mode = (fusion_arch is not None) and (modality == 'petct')
+        self.missing_modality_robust = bool(missing_modality_robust) and self.intermediate_fusion_mode
+        self.fusion_arch = fusion_arch
         self.first_conv_key = None
+        if force_inference_modality is not None and not self.missing_modality_robust:
+            raise ValueError(
+                "--force_inference_modality requires a missing_modality_robust "
+                "checkpoint (got missing_modality_robust="
+                f"{self.missing_modality_robust}). This checkpoint has no "
+                "single-modality inference code path."
+            )
+        self.force_inference_modality = force_inference_modality
         if self.petct_mode:
             dataset_json = dict(dataset_json)
             dataset_json['channel_names'] = {'0': 'CT', '1': 'PET'}
-            print('[petct] Patched dataset_json channel_names for PET+CT early fusion.')
+            print('[petct] Patched dataset_json channel_names for PET+CT.')
 
         configuration_manager = plans_manager.get_configuration(configuration_name, modality=modality)
         # restore network
@@ -307,17 +349,34 @@ class LesionLocatorSegmenter(object):
         if trainer_class is None:
             raise RuntimeError(f'Unable to locate trainer class {trainer_name} in lesionlocator.training.LesionLocatorTrainer. '
                                f'Please place it there (in any .py file)!')
+
+        arch_class_name = configuration_manager.network_arch_class_name
+        arch_init_kwargs = configuration_manager.network_arch_init_kwargs
+        arch_init_kwargs_req_import = configuration_manager.network_arch_init_kwargs_req_import
+        if self.intermediate_fusion_mode:
+            arch_init_kwargs = dict(arch_init_kwargs)
+            arch_class_name = 'lesionlocator.modules.multimodal_unet.IntermediateFusionResEncUNet'
+            arch_init_kwargs['fusion_arch'] = self.fusion_arch
+            if self.missing_modality_robust:
+                arch_init_kwargs['missing_modality_robust'] = True
+            print(f'[intermediate-fusion] Using IntermediateFusionResEncUNet with '
+                  f'fusion_arch={self.fusion_arch}, missing_modality_robust={self.missing_modality_robust}')
+
         network = trainer_class.build_network_architecture(
-            configuration_manager.network_arch_class_name,
-            configuration_manager.network_arch_init_kwargs,
-            configuration_manager.network_arch_init_kwargs_req_import,
+            arch_class_name,
+            arch_init_kwargs,
+            arch_init_kwargs_req_import,
             num_input_channels,
             plans_manager.get_label_manager(dataset_json).num_segmentation_heads,
-            enable_deep_supervision=False
+            enable_deep_supervision=True
         )
+        # Checkpoints trained with DS=True; disable at inference so forward returns single tensor.
+        if hasattr(network, 'decoder') and hasattr(network.decoder, 'deep_supervision'):
+            network.decoder.deep_supervision = False
 
-        # PET+CT early fusion: extend first conv from 2 -> 3 input channels before load_state_dict.
-        if self.petct_mode:
+        # Early fusion: extend first conv 2→3 channels. Not needed for intermediate fusion
+        # (shared encoder uses 2-channel input).
+        if self.petct_mode and not self.intermediate_fusion_mode:
             self.first_conv_key = self._find_first_conv_key(parameters[0])
             expected_in_ch = num_input_channels + 1
             current_in_ch = parameters[0][self.first_conv_key].shape[1]
@@ -334,8 +393,44 @@ class LesionLocatorSegmenter(object):
         self.configuration_manager = configuration_manager
         self.list_of_parameters = parameters
 
-        network.load_state_dict(parameters[0])
-        
+        if self.intermediate_fusion_mode:
+            has_fusion_keys = any(k.startswith('fusion_modules') for k in parameters[0])
+            if has_fusion_keys:
+                network.load_state_dict(parameters[0])
+                print('[intermediate-fusion] Loaded trained intermediate checkpoint (strict).')
+            else:
+                missing, unexpected = network.load_state_dict(parameters[0], strict=False)
+                non_fusion_missing = [
+                    k for k in missing
+                    if not k.startswith('fusion_modules')
+                    and not k.startswith('specific_encoder_ct')
+                    and not k.startswith('specific_encoder_pet')
+                    and not k.startswith('gen_ct')
+                    and not k.startswith('gen_pet')
+                    and not k.startswith('combine_ct')
+                    and not k.startswith('combine_pet')
+                    and not k.startswith('domain_classifier')
+                    and not (k.startswith('decoder.seg_layers.')
+                             and not k.startswith('decoder.seg_layers.0.'))
+                ]
+                if non_fusion_missing:
+                    raise RuntimeError(
+                        f'[intermediate-fusion] Non-fusion keys missing from CT seed: {non_fusion_missing}'
+                    )
+                if unexpected:
+                    raise RuntimeError(
+                        f'[intermediate-fusion] Unexpected keys in CT seed checkpoint: {unexpected}'
+                    )
+                n_fusion = sum(1 for k in missing if k.startswith('fusion_modules'))
+                n_aux_heads = sum(1 for k in missing
+                                  if k.startswith('decoder.seg_layers.')
+                                  and not k.startswith('decoder.seg_layers.0.'))
+                print(f'[intermediate-fusion] CT seed loaded. '
+                      f'Fusion modules ({n_fusion} keys) and DS aux heads ({n_aux_heads} keys) '
+                      f'retain random init.')
+        else:
+            network.load_state_dict(parameters[0])
+
         self.network = network
         self.dataset_json = dataset_json
         self.trainer_name = trainer_name
@@ -533,20 +628,25 @@ class LesionLocatorSegmenter(object):
         if os.path.isdir(source_folder_or_file):
             assert os.path.isdir(prompt_folder_or_file), \
                 "If '-i' is a folder then '-p' (prompt) must also be a folder."
-            # Group input files by case (each element is a list of channel files)
-            input_files = self._group_input_files_by_case(
+            # Group input files by case; each element is (case_id, file_group, inference_modality)
+            input_files_grouped = self._group_input_files_by_case(
                 source_folder_or_file, _file_ending, _num_modalities)
+            case_ids = [c for c, _, _ in input_files_grouped]
+            input_files = [g for _, g, _ in input_files_grouped]
+            inference_modalities = [m for _, _, m in input_files_grouped]
             prompt_files_json = subfiles(prompt_folder_or_file, suffix='.json', join=True, sort=True)
             prompt_files_mask = subfiles(prompt_folder_or_file, suffix=_file_ending, join=True, sort=True)
 
-            output_basenames = ['_'.join(os.path.basename(group[0]).split('.')[0].split('_')[:3]) for group in input_files]
+            output_basenames = case_ids
             output_files = [join(output_folder_or_file, name) for name in output_basenames]
 
             if not os.path.isdir(output_folder_or_file):
                 os.makedirs(output_folder_or_file)
             finished_files = subfiles(output_folder_or_file, suffix=_file_ending, join=True, sort=True)
-            finished_output_files = ['_'.join(os.path.basename(i).split('.')[0].split('_')[:3]) for i in finished_files]
-            finished_output_files = set(finished_output_files)
+            finished_output_files = {
+                os.path.basename(i)[:-len(_file_ending)].split('_lesion_')[0]
+                for i in finished_files if '_lesion_' in os.path.basename(i)
+            }
 
             # Assertions
             if len(input_files) == 0:
@@ -564,7 +664,10 @@ class LesionLocatorSegmenter(object):
                 input_files = [input_files[i] for i in not_existing_indices]
                 prompt_files = [prompt_files[i] for i in not_existing_indices]
                 output_files = [output_files[i] for i in not_existing_indices]
-
+                inference_modalities = [inference_modalities[i] for i in not_existing_indices]
+                if len(input_files) == 0:
+                    print(f'All {len(output_basenames)} case(s) already finished (--continue_prediction). Nothing to do.')
+                    return
 
         else:
             assert not os.path.isdir(prompt_folder_or_file), \
@@ -577,22 +680,24 @@ class LesionLocatorSegmenter(object):
             input_files = [[source_folder_or_file]]
             prompt_files = [prompt_folder_or_file]
             output_files = [join(output_folder_or_file, os.path.basename(source_folder_or_file))]
+            inference_modalities = [None]
 
         # only evaluate tracking using TP1 and TP2
         indices = [j for j, i in enumerate(input_files) if 'TP0' not in os.path.basename(i[0])]
         input_files = [input_files[i] for i in indices]
         prompt_files = [prompt_files[i] for i in indices]
         output_files = [output_files[i] for i in indices]
+        inference_modalities = [inference_modalities[i] for i in indices]
 
         # Truncate output files
         print('Total number of input files: ', len(input_files))
         output_files = [i.replace(self.dataset_json['file_ending'], '') for i in output_files]
-        
+
         print('Number of input files before part selection: ', len(input_files))
         data_iterator = preprocessing_iterator_fromfiles(input_files, prompt_files,
                                                 output_files, prompt_type, self.plans_manager, self.dataset_json,
                                                 self.configuration_manager, num_processes_preprocessing, self.device.type == 'cuda',
-                                                self.verbose_preprocessing, self.track)
+                                                self.verbose_preprocessing, self.track, inference_modalities)
         print('Number of input files after part selection: ', len(input_files))
         return self.predict_from_data_iterator(data_iterator, prompt_type, output_folder_or_file, num_processes_segmentation_export)
 
@@ -687,6 +792,21 @@ class LesionLocatorSegmenter(object):
                 properties = preprocessed['data_properties']
                 prompt = preprocessed['prompt']
                 seg_mask = preprocessed['seg']
+
+                # Per-case single-modality inference: --force_inference_modality overrides for
+                # measurement runs; auto-detected case_inference_modality handles real missing files.
+                case_inference_modality = preprocessed.get('inference_modality', None)
+                if self.force_inference_modality is not None:
+                    case_inference_modality = self.force_inference_modality
+                if case_inference_modality is not None and not self.missing_modality_robust:
+                    raise ValueError(
+                        f"Case {os.path.basename(ofile)} requires single-modality "
+                        f"inference (inference_modality={case_inference_modality}) "
+                        "but the loaded checkpoint is not missing_modality_robust."
+                    )
+                if self.missing_modality_robust:
+                    self._resolve_network_module().inference_modality = case_inference_modality
+
                 # let's not get into a runaway situation where the GPU predicts so fast that the disk has to b swamped with files
                 proceed = not check_workers_alive_and_busy(export_pool, worker_list, r, allowed_num_queued=2)
                 while not proceed:
@@ -708,6 +828,7 @@ class LesionLocatorSegmenter(object):
                             print(f"--- No prompt found for Lesion ID {inst_id} ---")
                             continue
                         print(f'\n Lesion ID {inst_id}: ')
+                        bbox_centered = None  # reset per-lesion to prevent stale carryover
                         for k in error_all.keys():
                             if k == 'lesion_all' or k == 'lesion_found':
                                 continue
@@ -767,62 +888,19 @@ class LesionLocatorSegmenter(object):
                             prompt_bl = torch.from_numpy(prev_seg_resampled).unsqueeze(0).to(self.device).half()
                             print('Resampled prompt shape: ', prompt_bl.shape)
                             
-                            # Apply lesion-focused cropping if enabled
+                            # NOTE: --lesion_focus does NOT crop the tracking path.
+                            # TrackNet uses full-volume deformable registration (icon_registration)
+                            # which requires global anatomy context. Cropping to a lesion bbox
+                            # would break the registration. Memory savings from --lesion_focus
+                            # apply only to the segmentation branch below.
                             if self.lesion_focus:
-                                # Get center of the mask
-                                # for bl data
-                                bl_prompt_coords = torch.where(prompt_bl > 0)
-                                
-                                # Get center of the mask
-                                bl_spacing = preprocessed['bl_data_properties']['spacing']
-                                data_spacing = preprocessed['data_properties']['spacing']
+                                print('[lesion_focus] Tracking path uses full volume (registration requires global FOV). '
+                                      'Cropping not applied; bbox_centered remains None for this lesion.')
 
-                                # resample bl_prompt from bl_spacing to data_spacing if they are different
-                                if bl_spacing != data_spacing:
-                                    print(f'Resampling baseline prompt from spacing {bl_spacing} to {data_spacing}')
-                                    bl_prompt_resampled = self.configuration_manager.resampling_fn_seg(
-                                        prompt_bl.cpu().numpy(), 
-                                        data.shape[1:], 
-                                        bl_spacing, 
-                                        data_spacing
-                                    )[0]
-                                    prompt_bl_resampled = torch.from_numpy(bl_prompt_resampled).unsqueeze(0).to(self.device).half()
-                                    print('Resampled baseline prompt shape: ', prompt_bl_resampled.shape)
-                                
-                                    prompt_coords = torch.where(prompt_bl_resampled > 0)
-                                else:
-                                    prompt_coords = bl_prompt_coords
-
-                                if len(prompt_coords[0]) > 0:
-                                    if prompt_bl.dim() == 4:
-                                        prompt_coords = prompt_coords[1:]  # Add batch dimension if missing
-                                    
-                                    center = [
-                                        int((prompt_coords[0].min().item() + prompt_coords[0].max().item()) / 2),
-                                        int((prompt_coords[1].min().item() + prompt_coords[1].max().item()) / 2),
-                                        int((prompt_coords[2].min().item() + prompt_coords[2].max().item()) / 2)
-                                    ]
-                                    
-                                    half_size = self.crop_size // 2
-                                    if data.dim() == 4:
-                                        data_shape = data.shape[1:]  # Add batch dimension if missing
-                                    else:
-                                        data_shape = data.shape
-
-                                    bbox_centered = [
-                                        max(0, center[0] - half_size),
-                                        min(data_shape[0], center[0] + half_size),
-                                        max(0, center[1] - half_size),
-                                        min(data_shape[1], center[1] + half_size),
-                                        max(0, center[2] - half_size),
-                                        min(data_shape[2], center[2] + half_size)
-                                    ]
-                                
-                            
                             # Clear embeddings before prediction
                             if self.extract_embeddings and self.embedding_extractor_tracker is not None:
                                 self.embedding_extractor_tracker.clear()
-                            
+
                             # Predict the logits using the preprocessed data and the prompt
                             prediction = self.track_single_lesion(torch.from_numpy(bl_data[np.newaxis,:]).to(self.device), data.unsqueeze(0).to(self.device), prompt_bl.unsqueeze(0)).cpu()
                                                         
@@ -880,11 +958,11 @@ class LesionLocatorSegmenter(object):
                                         # calculate the center of nonezeros in mask_gt[0]
                                         prompt_coords = torch.where(torch.from_numpy(gt_mask[0]) > 0)
                                         center = [
+                                            int((prompt_coords[0].min().item() + prompt_coords[0].max().item()) / 2),
                                             int((prompt_coords[1].min().item() + prompt_coords[1].max().item()) / 2),
-                                            int((prompt_coords[2].min().item() + prompt_coords[2].max().item()) / 2),
-                                            int((prompt_coords[0].min().item() + prompt_coords[0].max().item()) / 2)
+                                            int((prompt_coords[2].min().item() + prompt_coords[2].max().item()) / 2)
                                         ]
-                                        data_spacing = preprocessed['data_properties']['spacing'][::-1]
+                                        data_spacing = preprocessed['data_properties']['spacing']
                                         center_physical = [
                                             center[0] * data_spacing[0],
                                             center[1] * data_spacing[1],
@@ -1029,11 +1107,11 @@ class LesionLocatorSegmenter(object):
                                         seg_embeddings_np['bbox'] = np.array(bbox_centered)
                                         prompt_coords = torch.where(torch.from_numpy(gt_mask[0]) > 0)
                                         center = [
+                                            int((prompt_coords[0].min().item() + prompt_coords[0].max().item()) / 2),
                                             int((prompt_coords[1].min().item() + prompt_coords[1].max().item()) / 2),
-                                            int((prompt_coords[2].min().item() + prompt_coords[2].max().item()) / 2),
-                                            int((prompt_coords[0].min().item() + prompt_coords[0].max().item()) / 2)
+                                            int((prompt_coords[2].min().item() + prompt_coords[2].max().item()) / 2)
                                         ]
-                                        # convert center to physical space using spacing
+                                        # convert center to physical space using spacing (z,y,x)
                                         data_spacing = preprocessed['data_properties']['spacing']
                                         center_physical = [
                                             center[0] * data_spacing[0],
@@ -1735,8 +1813,22 @@ def segment_and_track():
     parser.add_argument('--adaptive_mode', action='store_true', help='Enable selection between segmentation and tracking based on Dice/NSD scores.')
     parser.add_argument('--lesion_focus', action='store_true', help='Enable lesion-focused inference by prioritizing patches overlapping with the prompt, rather than strict bbox-focused. This can improve performance for larger lesions that do not fit entirely within the patch size.')
     parser.add_argument('--crop_size', type=int, default=128, help='Crop size for lesion-focused inference. Only used if --lesion_focus is set. Default: 128')
+    parser.add_argument('--fusion_arch', type=str, required=False, default=None,
+                        choices=['weighted', 'mcsa'],
+                        help="Only used with --modality petct. Set to 'weighted' or 'mcsa' to load an "
+                             "intermediate-fusion checkpoint (IntermediateFusionResEncUNet). Auto-detected "
+                             "from the checkpoint if omitted.")
+    parser.add_argument('--missing_modality_robust', action='store_true', required=False, default=False,
+                        help="Only used with --modality petct and --fusion_arch weighted/mcsa. Set this if "
+                             "the checkpoint was trained with the ShaSpec-inspired missing-modality "
+                             "robustness add-on. Auto-detected from the checkpoint if omitted.")
+    parser.add_argument('--force_inference_modality', type=str, required=False, default=None,
+                        choices=['ct', 'pet'],
+                        help="Measurement-only override: force EVERY case's forward pass to drop the "
+                             "other modality, even if both _0000/_0001 files are present on disk. "
+                             "Requires --missing_modality_robust.")
     parser.add_argument('--extract_embeddings', action='store_true', required=False, default=False,
-                        help='Extract and save intermediate layer embeddings from both segmentation and tracking networks') 
+                        help='Extract and save intermediate layer embeddings from both segmentation and tracking networks')
     parser.add_argument('--embedding_output_folder', type=str, required=False, default=None,
                         help='Folder to save extracted embeddings. Must be specified if --extract_embeddings is set.')
     parser.add_argument('--embedding_layers', type=str, nargs='+', required=False, default=None,
@@ -1795,7 +1887,12 @@ def segment_and_track():
     checkpoint_folder = join(args.m, 'LesionLocatorSeg', optimized_ckpt)
     checkpoint_folder_track = join(args.m, 'LesionLocatorTrack')
     # checkpoint_folder_track = join(args.m, 'LesionLocatorSeg')
-    predictor.initialize_from_trained_model_folder(checkpoint_folder, checkpoint_folder_track, args.f, args.modality, "checkpoint_final.pth")
+    predictor.initialize_from_trained_model_folder(
+        checkpoint_folder, checkpoint_folder_track, args.f, args.modality, "checkpoint_final.pth",
+        fusion_arch=getattr(args, 'fusion_arch', None),
+        missing_modality_robust=getattr(args, 'missing_modality_robust', False),
+        force_inference_modality=getattr(args, 'force_inference_modality', None)
+    )
     
     # Enable embedding extraction if requested
     if args.extract_embeddings:
