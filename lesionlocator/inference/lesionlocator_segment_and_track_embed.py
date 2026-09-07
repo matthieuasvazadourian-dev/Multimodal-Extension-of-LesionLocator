@@ -827,33 +827,31 @@ class LesionLocatorSegmenter(object):
                                         track_embeddings_np[key] = feat.numpy()
                                     track_embeddings_np['dice'] = dice_score
 
+                                    # Physical-position metadata: derived from the ground-truth mask and
+                                    # data_properties, independent of --lesion_focus / whether a crop was
+                                    # applied for this lesion. Tracking never crops (see note above), so
+                                    # this must NOT be nested under the crop guard below.
+                                    prompt_coords = torch.where(torch.from_numpy(gt_mask[0]) > 0)
+                                    center = [
+                                        int((prompt_coords[0].min().item() + prompt_coords[0].max().item()) / 2),
+                                        int((prompt_coords[1].min().item() + prompt_coords[1].max().item()) / 2),
+                                        int((prompt_coords[2].min().item() + prompt_coords[2].max().item()) / 2)
+                                    ]
+                                    data_spacing = preprocessed['data_properties']['spacing']
+                                    center_physical = [
+                                        center[0] * data_spacing[0],
+                                        center[1] * data_spacing[1],
+                                        center[2] * data_spacing[2]
+                                    ]
+                                    track_embeddings_np['center'] = np.array(center)
+                                    track_embeddings_np['center_physical'] = np.array(center_physical)
+                                    data_physical_size = np.array(data.shape[1:]) * np.array(data_spacing)
+                                    track_embeddings_np['data_physical_size'] = data_physical_size
+
+                                    # Crop metadata: only meaningful when a crop was actually applied.
                                     if self.lesion_focus and bbox_centered is not None:
                                         track_embeddings_np['bbox'] = np.array(bbox_centered)
-                                        # # convert pixel location to physical spacing?
-                                        # center_physical = [
-                                        #     center[0] * self.target_spacing[0],
-                                        #     center[1] * self.target_spacing[1],
-                                        #     center[2] * self.target_spacing[2]
-                                        # ]
-                                        # calculate the center of nonezeros in mask_gt[0]
-                                        prompt_coords = torch.where(torch.from_numpy(gt_mask[0]) > 0)
-                                        center = [
-                                            int((prompt_coords[0].min().item() + prompt_coords[0].max().item()) / 2),
-                                            int((prompt_coords[1].min().item() + prompt_coords[1].max().item()) / 2),
-                                            int((prompt_coords[2].min().item() + prompt_coords[2].max().item()) / 2)
-                                        ]
-                                        data_spacing = preprocessed['data_properties']['spacing']
-                                        center_physical = [
-                                            center[0] * data_spacing[0],
-                                            center[1] * data_spacing[1],
-                                            center[2] * data_spacing[2]
-                                        ]
-                                        track_embeddings_np['center'] = np.array(center)
-                                        track_embeddings_np['center_physical'] = np.array(center_physical)
                                         track_embeddings_np['crop_size'] = self.crop_size
-
-                                        data_physical_size = np.array(data.shape[1:]) * np.array(data_spacing)
-                                        track_embeddings_np['data_physical_size'] = data_physical_size
 
                                     # check the byte size of track_embeddings_np
                                     total_bytes = sum(feat.nbytes for key, feat in track_embeddings_np.items() if 'decoder_stages_2' in key)
@@ -983,27 +981,32 @@ class LesionLocatorSegmenter(object):
                                         print(f'  {key}: shape={feat.shape}, dtype={feat.dtype}')
 
                                     seg_embeddings_np['dice'] = dice_score
+
+                                    # Physical-position metadata: independent of --lesion_focus / whether
+                                    # a crop was actually applied for this lesion (an empty prompt forces
+                                    # bbox_centered=None even with --lesion_focus set).
+                                    prompt_coords = torch.where(torch.from_numpy(gt_mask[0]) > 0)
+                                    center = [
+                                        int((prompt_coords[0].min().item() + prompt_coords[0].max().item()) / 2),
+                                        int((prompt_coords[1].min().item() + prompt_coords[1].max().item()) / 2),
+                                        int((prompt_coords[2].min().item() + prompt_coords[2].max().item()) / 2)
+                                    ]
+                                    # convert center to physical space using spacing (z,y,x)
+                                    data_spacing = preprocessed['data_properties']['spacing']
+                                    center_physical = [
+                                        center[0] * data_spacing[0],
+                                        center[1] * data_spacing[1],
+                                        center[2] * data_spacing[2]
+                                    ]
+                                    seg_embeddings_np['center'] = center
+                                    seg_embeddings_np['center_physical'] = np.array(center_physical)
+                                    data_physical_size = np.array(data.shape[1:]) * np.array(data_spacing)
+                                    seg_embeddings_np['data_physical_size'] = data_physical_size
+
+                                    # Crop metadata: only meaningful when a crop was actually applied.
                                     if self.lesion_focus and bbox_centered is not None:
                                         seg_embeddings_np['bbox'] = np.array(bbox_centered)
-                                        prompt_coords = torch.where(torch.from_numpy(gt_mask[0]) > 0)
-                                        center = [
-                                            int((prompt_coords[0].min().item() + prompt_coords[0].max().item()) / 2),
-                                            int((prompt_coords[1].min().item() + prompt_coords[1].max().item()) / 2),
-                                            int((prompt_coords[2].min().item() + prompt_coords[2].max().item()) / 2)
-                                        ]
-                                        # convert center to physical space using spacing (z,y,x)
-                                        data_spacing = preprocessed['data_properties']['spacing']
-                                        center_physical = [
-                                            center[0] * data_spacing[0],
-                                            center[1] * data_spacing[1],
-                                            center[2] * data_spacing[2]
-                                        ]
-                                        seg_embeddings_np['center'] = center
-                                        seg_embeddings_np['center_physical'] = np.array(center_physical)
                                         seg_embeddings_np['crop_size'] = self.crop_size
-
-                                        data_physical_size = np.array(data.shape[1:]) * np.array(data_spacing)
-                                        seg_embeddings_np['data_physical_size'] = data_physical_size
                                     print(f'Embeddings shape and dtype for lesion {inst_id}:')
                                     np.savez_compressed(seg_emb_path, **seg_embeddings_np)
                                     print(f'Saved segmentation embeddings to {seg_emb_path}')
