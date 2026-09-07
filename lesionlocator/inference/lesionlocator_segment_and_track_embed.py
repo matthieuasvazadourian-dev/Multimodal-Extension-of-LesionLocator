@@ -708,6 +708,7 @@ class LesionLocatorSegmenter(object):
                             print(f"--- No prompt found for Lesion ID {inst_id} ---")
                             continue
                         print(f'\n Lesion ID {inst_id}: ')
+                        bbox_centered = None  # reset per-lesion to prevent stale carryover
                         for k in error_all.keys():
                             if k == 'lesion_all' or k == 'lesion_found':
                                 continue
@@ -767,58 +768,15 @@ class LesionLocatorSegmenter(object):
                             prompt_bl = torch.from_numpy(prev_seg_resampled).unsqueeze(0).to(self.device).half()
                             print('Resampled prompt shape: ', prompt_bl.shape)
                             
-                            # Apply lesion-focused cropping if enabled
+                            # NOTE: --lesion_focus does NOT crop the tracking path.
+                            # TrackNet uses full-volume deformable registration (icon_registration)
+                            # which requires global anatomy context. Cropping to a lesion bbox
+                            # would break the registration. Memory savings from --lesion_focus
+                            # apply only to the segmentation branch below.
                             if self.lesion_focus:
-                                # Get center of the mask
-                                # for bl data
-                                bl_prompt_coords = torch.where(prompt_bl > 0)
-                                
-                                # Get center of the mask
-                                bl_spacing = preprocessed['bl_data_properties']['spacing']
-                                data_spacing = preprocessed['data_properties']['spacing']
+                                print('[lesion_focus] Tracking path uses full volume (registration requires global FOV). '
+                                      'Cropping not applied; bbox_centered remains None for this lesion.')
 
-                                # resample bl_prompt from bl_spacing to data_spacing if they are different
-                                if bl_spacing != data_spacing:
-                                    print(f'Resampling baseline prompt from spacing {bl_spacing} to {data_spacing}')
-                                    bl_prompt_resampled = self.configuration_manager.resampling_fn_seg(
-                                        prompt_bl.cpu().numpy(), 
-                                        data.shape[1:], 
-                                        bl_spacing, 
-                                        data_spacing
-                                    )[0]
-                                    prompt_bl_resampled = torch.from_numpy(bl_prompt_resampled).unsqueeze(0).to(self.device).half()
-                                    print('Resampled baseline prompt shape: ', prompt_bl_resampled.shape)
-                                
-                                    prompt_coords = torch.where(prompt_bl_resampled > 0)
-                                else:
-                                    prompt_coords = bl_prompt_coords
-
-                                if len(prompt_coords[0]) > 0:
-                                    if prompt_bl.dim() == 4:
-                                        prompt_coords = prompt_coords[1:]  # Add batch dimension if missing
-                                    
-                                    center = [
-                                        int((prompt_coords[0].min().item() + prompt_coords[0].max().item()) / 2),
-                                        int((prompt_coords[1].min().item() + prompt_coords[1].max().item()) / 2),
-                                        int((prompt_coords[2].min().item() + prompt_coords[2].max().item()) / 2)
-                                    ]
-                                    
-                                    half_size = self.crop_size // 2
-                                    if data.dim() == 4:
-                                        data_shape = data.shape[1:]  # Add batch dimension if missing
-                                    else:
-                                        data_shape = data.shape
-
-                                    bbox_centered = [
-                                        max(0, center[0] - half_size),
-                                        min(data_shape[0], center[0] + half_size),
-                                        max(0, center[1] - half_size),
-                                        min(data_shape[1], center[1] + half_size),
-                                        max(0, center[2] - half_size),
-                                        min(data_shape[2], center[2] + half_size)
-                                    ]
-                                
-                            
                             # Clear embeddings before prediction
                             if self.extract_embeddings and self.embedding_extractor_tracker is not None:
                                 self.embedding_extractor_tracker.clear()
@@ -880,11 +838,11 @@ class LesionLocatorSegmenter(object):
                                         # calculate the center of nonezeros in mask_gt[0]
                                         prompt_coords = torch.where(torch.from_numpy(gt_mask[0]) > 0)
                                         center = [
+                                            int((prompt_coords[0].min().item() + prompt_coords[0].max().item()) / 2),
                                             int((prompt_coords[1].min().item() + prompt_coords[1].max().item()) / 2),
-                                            int((prompt_coords[2].min().item() + prompt_coords[2].max().item()) / 2),
-                                            int((prompt_coords[0].min().item() + prompt_coords[0].max().item()) / 2)
+                                            int((prompt_coords[2].min().item() + prompt_coords[2].max().item()) / 2)
                                         ]
-                                        data_spacing = preprocessed['data_properties']['spacing'][::-1]
+                                        data_spacing = preprocessed['data_properties']['spacing']
                                         center_physical = [
                                             center[0] * data_spacing[0],
                                             center[1] * data_spacing[1],
@@ -1029,11 +987,11 @@ class LesionLocatorSegmenter(object):
                                         seg_embeddings_np['bbox'] = np.array(bbox_centered)
                                         prompt_coords = torch.where(torch.from_numpy(gt_mask[0]) > 0)
                                         center = [
+                                            int((prompt_coords[0].min().item() + prompt_coords[0].max().item()) / 2),
                                             int((prompt_coords[1].min().item() + prompt_coords[1].max().item()) / 2),
-                                            int((prompt_coords[2].min().item() + prompt_coords[2].max().item()) / 2),
-                                            int((prompt_coords[0].min().item() + prompt_coords[0].max().item()) / 2)
+                                            int((prompt_coords[2].min().item() + prompt_coords[2].max().item()) / 2)
                                         ]
-                                        # convert center to physical space using spacing
+                                        # convert center to physical space using spacing (z,y,x)
                                         data_spacing = preprocessed['data_properties']['spacing']
                                         center_physical = [
                                             center[0] * data_spacing[0],
