@@ -36,8 +36,15 @@ from lesionlocator.utilities.surface_distance_based_measures import compute_surf
 
 
 class EmbeddingExtractor:
-    """Extract intermediate features from specific layers using forward hooks"""
-    
+    """Extract intermediate features from specific layers using forward hooks.
+
+    Under intermediate fusion, the weight-tied encoder runs once per present
+    modality (CT pass, then PET pass) within a single top-level forward call,
+    so a hooked encoder layer fires more than once per lesion. `embeddings`
+    therefore accumulates a list per layer name instead of overwriting; see
+    get_embeddings() for how that list becomes output keys.
+    """
+
     def __init__(self, model, layer_names=None):
         """
         Args:
@@ -50,14 +57,34 @@ class EmbeddingExtractor:
         self.hooks = []
         self.hooked_layer_names = []
         self.layer_names = layer_names
-        
+        # Set externally (per case, before each forward) by the caller when the
+        # model may invoke a hooked layer more than once per forward -- e.g.
+        # ['ct', 'pet'] for intermediate fusion. None means "don't relabel";
+        # see get_embeddings().
+        self.pass_labels = None
+
         # Auto-detect decoder/encoder stages if no specific layers provided
         if layer_names is None:
             layer_names = self._auto_detect_layers()
-        
+
+        # Fused skip connections (fusion_modules.N) are the one tensor that
+        # actually combines both modalities. Always hook them exactly (not via
+        # the substring matching below, which would also pick up their
+        # internal submodules -- attention projections, norms, etc. -- since
+        # e.g. MCSAFusionWrapper is not a leaf module) so the deliverable isn't
+        # silently gated behind --embedding_layers.
+        exact_names = self._fusion_module_names()
+
         # Register hooks for matching layers
-        self._register_hooks(layer_names)
-    
+        self._register_hooks(layer_names, exact_names)
+
+    def _fusion_module_names(self):
+        """Top-level fusion_modules.N names, if the model has an intermediate-fusion fusion_modules ModuleList."""
+        fusion_modules = getattr(self.model, 'fusion_modules', None)
+        if fusion_modules is None:
+            return set()
+        return {f'fusion_modules.{i}' for i in range(len(fusion_modules))}
+
     def _auto_detect_layers(self):
         """Auto-detect decoder and encoder stage layers"""
         detected = []
@@ -67,44 +94,70 @@ class EmbeddingExtractor:
                 if name.count('.') == 2:  # e.g., 'decoder.stages.0'
                     detected.append(name)
         return detected
-    
-    def _register_hooks(self, layer_names):
-        """Register forward hooks for specified layers"""
+
+    def _register_hooks(self, layer_names, exact_names=None):
+        """Register forward hooks for specified layers.
+
+        `exact_names` match by full name only (used for fusion_modules.N, whose
+        submodules must NOT also match); `layer_names` match by substring, same
+        as before.
+        """
+        exact_names = exact_names or set()
         for name, module in self.model.named_modules():
-            # Check if this layer matches any of the patterns
-            if any(pattern in name for pattern in layer_names):
+            if name in exact_names or any(pattern in name for pattern in layer_names):
                 hook = module.register_forward_hook(self._make_hook(name))
                 self.hooks.append(hook)
                 self.hooked_layer_names.append(name)
                 if self.layer_names is not None:  # Only print if explicitly set
                     print(f"Registered hook for layer: {name}")
-    
+
     def _make_hook(self, layer_name):
-        """Create a hook function that stores the output"""
+        """Create a hook function that appends the output (a layer may fire more than once per forward)."""
         def hook(module, input, output):
             # Store detached copy on CPU to save memory
-            if isinstance(output, tuple):
-                # Some layers return tuples
-                self.embeddings[layer_name] = output[0].detach().cpu().clone()
-            else:
-                self.embeddings[layer_name] = output.detach().cpu().clone()
+            t = output[0] if isinstance(output, tuple) else output
+            self.embeddings.setdefault(layer_name, []).append(t.detach().cpu().clone())
         return hook
-    
+
     def clear(self):
-        """Clear stored embeddings to free memory"""
+        """Clear stored embeddings to free memory. Does not reset pass_labels."""
         self.embeddings = {}
-    
+
     def remove_hooks(self):
         """Remove all registered hooks"""
         for hook in self.hooks:
             hook.remove()
         self.hooks = []
         self.hooked_layer_names = []
-    
+
     def get_embeddings(self):
-        """Get dictionary of extracted embeddings"""
-        return dict(self.embeddings)
-    
+        """Get dictionary of extracted embeddings.
+
+        `encoder.stages.*` (the shared encoder) is the only hooked layer group
+        that can run once per present modality (see class docstring) -- every
+        other layer (decoder, fusion_modules, specific encoders) fires exactly
+        once per forward no matter how many modalities were present, so it
+        never gets a modality suffix even when self.pass_labels happens to
+        have length 1 (a forced single-modality case). Where a suffix does
+        apply, self.pass_labels names it by modality (e.g. '..._ct', '..._pet')
+        when set and matching the invocation count; otherwise falls back to
+        positional ('..._pass0', '..._pass1', ...) so nothing this DOES fire
+        more than once for is silently dropped or overwritten.
+        """
+        result = {}
+        for layer_name, invocations in self.embeddings.items():
+            multi_pass_eligible = 'encoder.stages' in layer_name
+            labels = self.pass_labels if multi_pass_eligible else None
+            if labels is not None and len(labels) == len(invocations):
+                for label, t in zip(labels, invocations):
+                    result[f'{layer_name}_{label}'] = t
+            elif len(invocations) == 1:
+                result[layer_name] = invocations[0]
+            else:
+                for i, t in enumerate(invocations):
+                    result[f'{layer_name}_pass{i}'] = t
+        return result
+
     def get_layer_names(self):
         """Get list of layers being extracted"""
         return list(self.hooked_layer_names)
@@ -483,7 +536,13 @@ class LesionLocatorSegmenter(object):
                 configuration_manager_tracker.patch_size,
                 enable_deep_supervision=False
             )
-           
+
+            if self.intermediate_fusion_mode:
+                print('[tracker] No intermediate-fusion tracking checkpoint exists; the tracker '
+                      f'network is early-fusion (fusion_arch={self.fusion_arch} applies to the '
+                      'segmentation network only). Tracking embeddings come from the early-fusion '
+                      'tracker, not from the weighted/mcsa model.')
+
             if self.petct_mode:
                 tracker_first_conv_key = self._find_first_conv_key(parameters_tracker[0])
                 expected_in_ch_tracker = num_input_channels_tracker + 1
@@ -749,6 +808,17 @@ class LesionLocatorSegmenter(object):
                 properties = preprocessed['data_properties']
                 prompt = preprocessed['prompt']
                 seg_mask = preprocessed['seg']
+
+                # Under intermediate fusion the weight-tied encoder runs once per modality
+                # per forward (CT pass, then PET pass -- see EmbeddingExtractor docstring);
+                # tell both extractors how to label those two invocations. No missing-modality
+                # concept exists on this branch, so it's always both when fusion is active.
+                case_pass_labels = ['ct', 'pet'] if self.intermediate_fusion_mode else None
+                if self.embedding_extractor is not None:
+                    self.embedding_extractor.pass_labels = case_pass_labels
+                if self.embedding_extractor_tracker is not None:
+                    self.embedding_extractor_tracker.pass_labels = case_pass_labels
+
                 # let's not get into a runaway situation where the GPU predicts so fast that the disk has to b swamped with files
                 proceed = not check_workers_alive_and_busy(export_pool, worker_list, r, allowed_num_queued=2)
                 while not proceed:
@@ -889,33 +959,31 @@ class LesionLocatorSegmenter(object):
                                         track_embeddings_np[key] = feat.numpy()
                                     track_embeddings_np['dice'] = dice_score
 
+                                    # Physical-position metadata: derived from the ground-truth mask and
+                                    # data_properties, independent of --lesion_focus / whether a crop was
+                                    # applied for this lesion. Tracking never crops (see note above), so
+                                    # this must NOT be nested under the crop guard below.
+                                    prompt_coords = torch.where(torch.from_numpy(gt_mask[0]) > 0)
+                                    center = [
+                                        int((prompt_coords[0].min().item() + prompt_coords[0].max().item()) / 2),
+                                        int((prompt_coords[1].min().item() + prompt_coords[1].max().item()) / 2),
+                                        int((prompt_coords[2].min().item() + prompt_coords[2].max().item()) / 2)
+                                    ]
+                                    data_spacing = preprocessed['data_properties']['spacing']
+                                    center_physical = [
+                                        center[0] * data_spacing[0],
+                                        center[1] * data_spacing[1],
+                                        center[2] * data_spacing[2]
+                                    ]
+                                    track_embeddings_np['center'] = np.array(center)
+                                    track_embeddings_np['center_physical'] = np.array(center_physical)
+                                    data_physical_size = np.array(data.shape[1:]) * np.array(data_spacing)
+                                    track_embeddings_np['data_physical_size'] = data_physical_size
+
+                                    # Crop metadata: only meaningful when a crop was actually applied.
                                     if self.lesion_focus and bbox_centered is not None:
                                         track_embeddings_np['bbox'] = np.array(bbox_centered)
-                                        # # convert pixel location to physical spacing?
-                                        # center_physical = [
-                                        #     center[0] * self.target_spacing[0],
-                                        #     center[1] * self.target_spacing[1],
-                                        #     center[2] * self.target_spacing[2]
-                                        # ]
-                                        # calculate the center of nonezeros in mask_gt[0]
-                                        prompt_coords = torch.where(torch.from_numpy(gt_mask[0]) > 0)
-                                        center = [
-                                            int((prompt_coords[0].min().item() + prompt_coords[0].max().item()) / 2),
-                                            int((prompt_coords[1].min().item() + prompt_coords[1].max().item()) / 2),
-                                            int((prompt_coords[2].min().item() + prompt_coords[2].max().item()) / 2)
-                                        ]
-                                        data_spacing = preprocessed['data_properties']['spacing']
-                                        center_physical = [
-                                            center[0] * data_spacing[0],
-                                            center[1] * data_spacing[1],
-                                            center[2] * data_spacing[2]
-                                        ]
-                                        track_embeddings_np['center'] = np.array(center)
-                                        track_embeddings_np['center_physical'] = np.array(center_physical)
                                         track_embeddings_np['crop_size'] = self.crop_size
-
-                                        data_physical_size = np.array(data.shape[1:]) * np.array(data_spacing)
-                                        track_embeddings_np['data_physical_size'] = data_physical_size
 
                                     # check the byte size of track_embeddings_np
                                     total_bytes = sum(feat.nbytes for key, feat in track_embeddings_np.items() if 'decoder_stages_2' in key)
@@ -1045,27 +1113,32 @@ class LesionLocatorSegmenter(object):
                                         print(f'  {key}: shape={feat.shape}, dtype={feat.dtype}')
 
                                     seg_embeddings_np['dice'] = dice_score
+
+                                    # Physical-position metadata: independent of --lesion_focus / whether
+                                    # a crop was actually applied for this lesion (an empty prompt forces
+                                    # bbox_centered=None even with --lesion_focus set).
+                                    prompt_coords = torch.where(torch.from_numpy(gt_mask[0]) > 0)
+                                    center = [
+                                        int((prompt_coords[0].min().item() + prompt_coords[0].max().item()) / 2),
+                                        int((prompt_coords[1].min().item() + prompt_coords[1].max().item()) / 2),
+                                        int((prompt_coords[2].min().item() + prompt_coords[2].max().item()) / 2)
+                                    ]
+                                    # convert center to physical space using spacing (z,y,x)
+                                    data_spacing = preprocessed['data_properties']['spacing']
+                                    center_physical = [
+                                        center[0] * data_spacing[0],
+                                        center[1] * data_spacing[1],
+                                        center[2] * data_spacing[2]
+                                    ]
+                                    seg_embeddings_np['center'] = center
+                                    seg_embeddings_np['center_physical'] = np.array(center_physical)
+                                    data_physical_size = np.array(data.shape[1:]) * np.array(data_spacing)
+                                    seg_embeddings_np['data_physical_size'] = data_physical_size
+
+                                    # Crop metadata: only meaningful when a crop was actually applied.
                                     if self.lesion_focus and bbox_centered is not None:
                                         seg_embeddings_np['bbox'] = np.array(bbox_centered)
-                                        prompt_coords = torch.where(torch.from_numpy(gt_mask[0]) > 0)
-                                        center = [
-                                            int((prompt_coords[0].min().item() + prompt_coords[0].max().item()) / 2),
-                                            int((prompt_coords[1].min().item() + prompt_coords[1].max().item()) / 2),
-                                            int((prompt_coords[2].min().item() + prompt_coords[2].max().item()) / 2)
-                                        ]
-                                        # convert center to physical space using spacing (z,y,x)
-                                        data_spacing = preprocessed['data_properties']['spacing']
-                                        center_physical = [
-                                            center[0] * data_spacing[0],
-                                            center[1] * data_spacing[1],
-                                            center[2] * data_spacing[2]
-                                        ]
-                                        seg_embeddings_np['center'] = center
-                                        seg_embeddings_np['center_physical'] = np.array(center_physical)
                                         seg_embeddings_np['crop_size'] = self.crop_size
-
-                                        data_physical_size = np.array(data.shape[1:]) * np.array(data_spacing)
-                                        seg_embeddings_np['data_physical_size'] = data_physical_size
                                     print(f'Embeddings shape and dtype for lesion {inst_id}:')
                                     np.savez_compressed(seg_emb_path, **seg_embeddings_np)
                                     print(f'Saved segmentation embeddings to {seg_emb_path}')
