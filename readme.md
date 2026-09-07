@@ -8,6 +8,18 @@ via the LETITIA fork (X. Chen, SDSC/EPFL).
 > **Authors**: Maximilian Rokuss, Yannick Kirchhoff, Seval Akbal, Balint Kovacs, Saikat Roy, Constantin Ulrich, Tassilo Wald, Lukas T. Rotkopf, Heinz-Peter Schlemmer and Klaus Maier-Hein  
 > **Paper**: [![CVPR](https://img.shields.io/badge/%20CVPR%202025%20-open%20access-blue.svg)](https://openaccess.thecvf.com/content/CVPR2025/html/Rokuss_LesionLocator_Zero-Shot_Universal_Tumor_Segmentation_and_Tracking_in_3D_Whole-Body_CVPR_2025_paper.html)
 
+The fusion architectures are informed by:
+
+ [H2ASeg](https://arxiv.org/abs/2403.18339) (Lu et al., 2024) — the `mcsa` cross-modal attention fusion.
+
+> **Authors**: Jinpeng Lu, Jingyun Chen, Linghan Cai, Songhan Jiang and Yongbing Zhang  
+> **Paper**: [![arXiv](https://img.shields.io/badge/%20arXiv%202403.18339%20-preprint-b31b1b.svg)](https://arxiv.org/abs/2403.18339)
+
+ [ShaSpec](https://openaccess.thecvf.com/content/CVPR2023/html/Wang_Multi-Modal_Learning_With_Missing_Modality_via_Shared-Specific_Feature_Modelling_CVPR_2023_paper.html) (Wang et al., CVPR 2023) — the missing-modality robustness layer.
+
+> **Authors**: Hu Wang, Yuanhong Chen, Congbo Ma, Jodie Avery, Louise Hull and Gustavo Carneiro  
+> **Paper**: [![CVPR](https://img.shields.io/badge/%20CVPR%202023%20-open%20access-blue.svg)](https://openaccess.thecvf.com/content/CVPR2023/html/Wang_Multi-Modal_Learning_With_Missing_Modality_via_Shared-Specific_Feature_Modelling_CVPR_2023_paper.html)
+
 ---
 
 ## Branches
