@@ -364,5 +364,3 @@ LesionLocator_track_embed \
     year      = {2023}, pages = {15878-15887}
 }
 ```
-
-GPL-3.0, inherited from LesionLocator.
