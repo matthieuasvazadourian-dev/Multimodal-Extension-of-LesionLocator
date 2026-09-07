@@ -365,4 +365,3 @@ LesionLocator_track_embed \
 }
 ```
 
-GPL-3.0, inherited from LesionLocator.
