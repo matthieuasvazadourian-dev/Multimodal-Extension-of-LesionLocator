@@ -191,6 +191,8 @@ class LesionLocatorSegmenter(object):
             print(f'Crop size: {self.crop_size}x{self.crop_size}x{self.crop_size}')
 
         self.petct_mode = False
+        self.intermediate_fusion_mode = False
+        self.fusion_arch = None
         self.first_conv_key = None
 
     @staticmethod
@@ -255,7 +257,8 @@ class LesionLocatorSegmenter(object):
                                              model_track_training_output_dir: str,
                                              use_folds: Union[Tuple[Union[int, str]], None],
                                              modality: str = 'ct',
-                                             checkpoint_name: str = 'checkpoint_final.pth'):
+                                             checkpoint_name: str = 'checkpoint_final.pth',
+                                             fusion_arch: str = None):
         """
         This is used when making predictions with a trained model
         """
@@ -287,17 +290,32 @@ class LesionLocatorSegmenter(object):
                 configuration_name = checkpoint['init_args']['configuration']
                 inference_allowed_mirroring_axes = checkpoint['inference_allowed_mirroring_axes'] if \
                     'inference_allowed_mirroring_axes' in checkpoint.keys() else None
+                # Auto-detect fusion_arch from checkpoint when not provided via CLI
+                fusion_arch_from_ckpt = checkpoint.get('fusion_arch', None)
+                if fusion_arch_from_ckpt not in (None, 'weighted', 'mcsa'):
+                    raise ValueError(
+                        f"Checkpoint uses removed fusion_arch='{fusion_arch_from_ckpt}'. "
+                        f"Old TAMW/Combined checkpoints are incompatible with current code. Retrain with --fusion_arch weighted or mcsa."
+                    )
+                if fusion_arch is None and fusion_arch_from_ckpt is not None:
+                    fusion_arch = fusion_arch_from_ckpt
+                    print(f'[intermediate-fusion] Auto-detected fusion_arch={fusion_arch} from checkpoint.')
+                elif fusion_arch is not None and fusion_arch_from_ckpt is not None and fusion_arch != fusion_arch_from_ckpt:
+                    raise ValueError(
+                        f'CLI --fusion_arch={fusion_arch} disagrees with checkpoint fusion_arch={fusion_arch_from_ckpt}'
+                    )
 
             parameters.append(checkpoint['network_weights'])
 
-        # PET+CT early-fusion: patch dataset_json so that num_input_channels = 2 and
-        # extend the first conv layer of each checkpoint to accept the extra PET channel.
+        # PET+CT: patch dataset_json so num_input_channels = 2 (both fusion modes).
         self.petct_mode = (modality == 'petct')
+        self.intermediate_fusion_mode = (fusion_arch is not None) and (modality == 'petct')
+        self.fusion_arch = fusion_arch
         self.first_conv_key = None
         if self.petct_mode:
             dataset_json = dict(dataset_json)
             dataset_json['channel_names'] = {'0': 'CT', '1': 'PET'}
-            print('[petct] Patched dataset_json channel_names for PET+CT early fusion.')
+            print('[petct] Patched dataset_json channel_names for PET+CT.')
 
         configuration_manager = plans_manager.get_configuration(configuration_name, modality=modality)
         # restore network
@@ -307,17 +325,32 @@ class LesionLocatorSegmenter(object):
         if trainer_class is None:
             raise RuntimeError(f'Unable to locate trainer class {trainer_name} in lesionlocator.training.LesionLocatorTrainer. '
                                f'Please place it there (in any .py file)!')
+
+        arch_class_name = configuration_manager.network_arch_class_name
+        arch_init_kwargs = configuration_manager.network_arch_init_kwargs
+        arch_init_kwargs_req_import = configuration_manager.network_arch_init_kwargs_req_import
+        if self.intermediate_fusion_mode:
+            arch_class_name = 'lesionlocator.modules.multimodal_unet.IntermediateFusionResEncUNet'
+            arch_init_kwargs = dict(arch_init_kwargs)
+            arch_init_kwargs['fusion_arch'] = self.fusion_arch
+            print(f'[intermediate-fusion] Using IntermediateFusionResEncUNet with fusion_arch={self.fusion_arch}')
+
         network = trainer_class.build_network_architecture(
-            configuration_manager.network_arch_class_name,
-            configuration_manager.network_arch_init_kwargs,
-            configuration_manager.network_arch_init_kwargs_req_import,
+            arch_class_name,
+            arch_init_kwargs,
+            arch_init_kwargs_req_import,
             num_input_channels,
             plans_manager.get_label_manager(dataset_json).num_segmentation_heads,
-            enable_deep_supervision=False
+            enable_deep_supervision=True
         )
+        # Checkpoints are trained with DS=True; disable DS at inference so forward returns
+        # a single tensor (not a list). Must happen AFTER build and BEFORE load_state_dict.
+        if hasattr(network, 'decoder') and hasattr(network.decoder, 'deep_supervision'):
+            network.decoder.deep_supervision = False
 
-        # PET+CT early fusion: extend first conv from 2 -> 3 input channels before load_state_dict.
-        if self.petct_mode:
+        # Early fusion: extend first conv from 2 -> 3 input channels before load_state_dict.
+        # Not needed for intermediate fusion (shared encoder uses 2-channel input).
+        if self.petct_mode and not self.intermediate_fusion_mode:
             self.first_conv_key = self._find_first_conv_key(parameters[0])
             expected_in_ch = num_input_channels + 1
             current_in_ch = parameters[0][self.first_conv_key].shape[1]
@@ -334,8 +367,37 @@ class LesionLocatorSegmenter(object):
         self.configuration_manager = configuration_manager
         self.list_of_parameters = parameters
 
-        network.load_state_dict(parameters[0])
-        
+        if self.intermediate_fusion_mode:
+            has_fusion_keys = any(k.startswith('fusion_modules') for k in parameters[0])
+            if has_fusion_keys:
+                network.load_state_dict(parameters[0])
+                print('[intermediate-fusion] Loaded trained intermediate checkpoint (strict).')
+            else:
+                missing, unexpected = network.load_state_dict(parameters[0], strict=False)
+                non_fusion_missing = [
+                    k for k in missing
+                    if not k.startswith('fusion_modules')
+                    and not (k.startswith('decoder.seg_layers.')
+                             and not k.startswith('decoder.seg_layers.0.'))
+                ]
+                if non_fusion_missing:
+                    raise RuntimeError(
+                        f'[intermediate-fusion] Non-fusion keys missing from CT seed: {non_fusion_missing}'
+                    )
+                if unexpected:
+                    raise RuntimeError(
+                        f'[intermediate-fusion] Unexpected keys in CT seed checkpoint: {unexpected}'
+                    )
+                n_fusion = sum(1 for k in missing if k.startswith('fusion_modules'))
+                n_aux_heads = sum(1 for k in missing
+                                  if k.startswith('decoder.seg_layers.')
+                                  and not k.startswith('decoder.seg_layers.0.'))
+                print(f'[intermediate-fusion] CT seed loaded. '
+                      f'Fusion modules ({n_fusion} keys) and DS aux heads ({n_aux_heads} keys) '
+                      f'retain random init.')
+        else:
+            network.load_state_dict(parameters[0])
+
         self.network = network
         self.dataset_json = dataset_json
         self.trainer_name = trainer_name
@@ -708,6 +770,7 @@ class LesionLocatorSegmenter(object):
                             print(f"--- No prompt found for Lesion ID {inst_id} ---")
                             continue
                         print(f'\n Lesion ID {inst_id}: ')
+                        bbox_centered = None  # reset per-lesion to prevent stale carryover
                         for k in error_all.keys():
                             if k == 'lesion_all' or k == 'lesion_found':
                                 continue
@@ -767,58 +830,15 @@ class LesionLocatorSegmenter(object):
                             prompt_bl = torch.from_numpy(prev_seg_resampled).unsqueeze(0).to(self.device).half()
                             print('Resampled prompt shape: ', prompt_bl.shape)
                             
-                            # Apply lesion-focused cropping if enabled
+                            # NOTE: --lesion_focus does NOT crop the tracking path.
+                            # TrackNet uses full-volume deformable registration (icon_registration)
+                            # which requires global anatomy context. Cropping to a lesion bbox
+                            # would break the registration. Memory savings from --lesion_focus
+                            # apply only to the segmentation branch below.
                             if self.lesion_focus:
-                                # Get center of the mask
-                                # for bl data
-                                bl_prompt_coords = torch.where(prompt_bl > 0)
-                                
-                                # Get center of the mask
-                                bl_spacing = preprocessed['bl_data_properties']['spacing']
-                                data_spacing = preprocessed['data_properties']['spacing']
+                                print('[lesion_focus] Tracking path uses full volume (registration requires global FOV). '
+                                      'Cropping not applied; bbox_centered remains None for this lesion.')
 
-                                # resample bl_prompt from bl_spacing to data_spacing if they are different
-                                if bl_spacing != data_spacing:
-                                    print(f'Resampling baseline prompt from spacing {bl_spacing} to {data_spacing}')
-                                    bl_prompt_resampled = self.configuration_manager.resampling_fn_seg(
-                                        prompt_bl.cpu().numpy(), 
-                                        data.shape[1:], 
-                                        bl_spacing, 
-                                        data_spacing
-                                    )[0]
-                                    prompt_bl_resampled = torch.from_numpy(bl_prompt_resampled).unsqueeze(0).to(self.device).half()
-                                    print('Resampled baseline prompt shape: ', prompt_bl_resampled.shape)
-                                
-                                    prompt_coords = torch.where(prompt_bl_resampled > 0)
-                                else:
-                                    prompt_coords = bl_prompt_coords
-
-                                if len(prompt_coords[0]) > 0:
-                                    if prompt_bl.dim() == 4:
-                                        prompt_coords = prompt_coords[1:]  # Add batch dimension if missing
-                                    
-                                    center = [
-                                        int((prompt_coords[0].min().item() + prompt_coords[0].max().item()) / 2),
-                                        int((prompt_coords[1].min().item() + prompt_coords[1].max().item()) / 2),
-                                        int((prompt_coords[2].min().item() + prompt_coords[2].max().item()) / 2)
-                                    ]
-                                    
-                                    half_size = self.crop_size // 2
-                                    if data.dim() == 4:
-                                        data_shape = data.shape[1:]  # Add batch dimension if missing
-                                    else:
-                                        data_shape = data.shape
-
-                                    bbox_centered = [
-                                        max(0, center[0] - half_size),
-                                        min(data_shape[0], center[0] + half_size),
-                                        max(0, center[1] - half_size),
-                                        min(data_shape[1], center[1] + half_size),
-                                        max(0, center[2] - half_size),
-                                        min(data_shape[2], center[2] + half_size)
-                                    ]
-                                
-                            
                             # Clear embeddings before prediction
                             if self.extract_embeddings and self.embedding_extractor_tracker is not None:
                                 self.embedding_extractor_tracker.clear()
@@ -880,11 +900,11 @@ class LesionLocatorSegmenter(object):
                                         # calculate the center of nonezeros in mask_gt[0]
                                         prompt_coords = torch.where(torch.from_numpy(gt_mask[0]) > 0)
                                         center = [
+                                            int((prompt_coords[0].min().item() + prompt_coords[0].max().item()) / 2),
                                             int((prompt_coords[1].min().item() + prompt_coords[1].max().item()) / 2),
-                                            int((prompt_coords[2].min().item() + prompt_coords[2].max().item()) / 2),
-                                            int((prompt_coords[0].min().item() + prompt_coords[0].max().item()) / 2)
+                                            int((prompt_coords[2].min().item() + prompt_coords[2].max().item()) / 2)
                                         ]
-                                        data_spacing = preprocessed['data_properties']['spacing'][::-1]
+                                        data_spacing = preprocessed['data_properties']['spacing']
                                         center_physical = [
                                             center[0] * data_spacing[0],
                                             center[1] * data_spacing[1],
@@ -1029,11 +1049,11 @@ class LesionLocatorSegmenter(object):
                                         seg_embeddings_np['bbox'] = np.array(bbox_centered)
                                         prompt_coords = torch.where(torch.from_numpy(gt_mask[0]) > 0)
                                         center = [
+                                            int((prompt_coords[0].min().item() + prompt_coords[0].max().item()) / 2),
                                             int((prompt_coords[1].min().item() + prompt_coords[1].max().item()) / 2),
-                                            int((prompt_coords[2].min().item() + prompt_coords[2].max().item()) / 2),
-                                            int((prompt_coords[0].min().item() + prompt_coords[0].max().item()) / 2)
+                                            int((prompt_coords[2].min().item() + prompt_coords[2].max().item()) / 2)
                                         ]
-                                        # convert center to physical space using spacing
+                                        # convert center to physical space using spacing (z,y,x)
                                         data_spacing = preprocessed['data_properties']['spacing']
                                         center_physical = [
                                             center[0] * data_spacing[0],
@@ -1735,6 +1755,11 @@ def segment_and_track():
     parser.add_argument('--adaptive_mode', action='store_true', help='Enable selection between segmentation and tracking based on Dice/NSD scores.')
     parser.add_argument('--lesion_focus', action='store_true', help='Enable lesion-focused inference by prioritizing patches overlapping with the prompt, rather than strict bbox-focused. This can improve performance for larger lesions that do not fit entirely within the patch size.')
     parser.add_argument('--crop_size', type=int, default=128, help='Crop size for lesion-focused inference. Only used if --lesion_focus is set. Default: 128')
+    parser.add_argument('--fusion_arch', type=str, required=False, default=None,
+                        choices=['weighted', 'mcsa'],
+                        help="Only used with --modality petct. Set to 'weighted' or 'mcsa' to load an "
+                             "intermediate-fusion checkpoint (IntermediateFusionResEncUNet). Auto-detected "
+                             "from the checkpoint if omitted.")
     parser.add_argument('--extract_embeddings', action='store_true', required=False, default=False,
                         help='Extract and save intermediate layer embeddings from both segmentation and tracking networks') 
     parser.add_argument('--embedding_output_folder', type=str, required=False, default=None,
@@ -1795,7 +1820,10 @@ def segment_and_track():
     checkpoint_folder = join(args.m, 'LesionLocatorSeg', optimized_ckpt)
     checkpoint_folder_track = join(args.m, 'LesionLocatorTrack')
     # checkpoint_folder_track = join(args.m, 'LesionLocatorSeg')
-    predictor.initialize_from_trained_model_folder(checkpoint_folder, checkpoint_folder_track, args.f, args.modality, "checkpoint_final.pth")
+    predictor.initialize_from_trained_model_folder(
+        checkpoint_folder, checkpoint_folder_track, args.f, args.modality, "checkpoint_final.pth",
+        fusion_arch=getattr(args, 'fusion_arch', None)
+    )
     
     # Enable embedding extraction if requested
     if args.extract_embeddings:
