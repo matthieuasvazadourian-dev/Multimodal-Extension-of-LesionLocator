@@ -49,6 +49,116 @@ pip install -e .
 
 ## Codebase
 
+### Chart of Intermediate Fusion Architecture
+```mermaid
+flowchart TD
+
+%% ───────────────────────────────────────────────
+%%  ==>  data flows this way
+%%  ..>  configures / observes
+%%  Nodes are components, not files. Click one to
+%%  open the code it stands for.
+%% ───────────────────────────────────────────────
+
+  entry["Entry points<br/><i>scripts/ wraps each run</i><br/>train · segment · track · track_embed"]
+
+subgraph IN["1 · Input"]
+  study["Paired PET/CT study<br/>CT = _0000 · PET = _0001<br/>+ lesion prompt"]
+  ckpt["CT-pretrained LesionLocator<br/>checkpoint"]
+end
+
+subgraph PIPE["2 · Data pipeline"]
+  io["Read &amp; align<br/><i>CT defines the reference grid;</i><br/><i>PET and labels resampled onto it</i>"]
+  prep["Preprocess<br/>CT intensity window · PET z-score<br/>resample · crop · patch"]
+  prompt["Prompt channel<br/>point · box · previous mask"]
+end
+
+subgraph MODEL["3 · Model"]
+  fusion["<b>Intermediate fusion</b><br/>shared encoder runs once per modality<br/>skip connections fused level by level<br/><i>starts identical to the CT-only model</i>"]
+  blocks["Fusion blocks<br/><b>weighted</b> — learned per-channel mixing<br/><b>mcsa</b> — cross-modal attention"]
+  net["Segmentation network<br/>residual-encoder U-Net"]
+  tracknet["TrackNet<br/>registers consecutive timepoints"]
+end
+
+subgraph RUN["4 · Execution"]
+  train["Fine-tuning<br/>CE + Dice loss<br/>patient-grouped cross-validation"]
+  infer["Inference<br/>sliding window over the volume"]
+end
+
+subgraph OUT["5 · Output"]
+  masks["Lesion masks"]
+  metrics["Dice · NSD · Hausdorff<br/>lesion detection rate"]
+  npz["Per-lesion embeddings <i>(.npz)</i><br/>features + dice + centroid + bbox"]
+end
+
+subgraph SIDE["Supporting tools"]
+  tools["Analysis<br/>fusion cost benchmark<br/>learned CT vs PET weight per level"]
+  missing["Missing-modality routing<br/>split a folder into per-modality subsets,<br/>one checkpoint per modality"]
+  tests["Tests <i>(CPU only)</i><br/>CT-passthrough · embedding capture"]
+end
+
+entry ==>|"runs"| train
+entry ==>|"runs"| infer
+
+study ==> io
+study ==>|"prompt files"| prompt
+io ==> prep
+
+prep ==>|"CT + PET channels"| fusion
+prompt ==>|"prompt channel"| fusion
+blocks -.->|"per-level fusion mechanism"| fusion
+ckpt -.->|"pretrained weights"| fusion
+fusion ==> net
+
+train -.->|"updates weights"| net
+infer -.->|"forward passes"| net
+net ==>|"predictions"| masks
+masks ==> metrics
+
+masks -.->|"mask from the previous timepoint"| tracknet
+tracknet ==>|"warped mask becomes the next prompt"| prompt
+net -.->|"features captured by forward hooks<br/>track_embed only"| npz
+
+tools -.->|"measure cost and behaviour of"| fusion
+tests -.->|"check"| fusion
+missing -.->|"route cases by available modality"| infer
+
+click entry "https://github.com/matthieuasvazadourian-dev/multimodal-extension-of-lesionlocator/tree/intermediate-fusion/scripts"
+click study "https://github.com/matthieuasvazadourian-dev/multimodal-extension-of-lesionlocator/blob/intermediate-fusion/readme.md"
+click ckpt "https://github.com/matthieuasvazadourian-dev/multimodal-extension-of-lesionlocator/blob/intermediate-fusion/readme.md"
+click io "https://github.com/matthieuasvazadourian-dev/multimodal-extension-of-lesionlocator/blob/intermediate-fusion/lesionlocator/imageio/simpleitk_reader_writer.py"
+click prep "https://github.com/matthieuasvazadourian-dev/multimodal-extension-of-lesionlocator/tree/intermediate-fusion/lesionlocator/preprocessing"
+click prompt "https://github.com/matthieuasvazadourian-dev/multimodal-extension-of-lesionlocator/tree/intermediate-fusion/lesionlocator/utilities/prompt_handling"
+click net "https://github.com/matthieuasvazadourian-dev/multimodal-extension-of-lesionlocator/blob/intermediate-fusion/lesionlocator/utilities/get_network_from_plans.py"
+click tracknet "https://github.com/matthieuasvazadourian-dev/multimodal-extension-of-lesionlocator/blob/intermediate-fusion/lesionlocator/modules/tracknet.py"
+click train "https://github.com/matthieuasvazadourian-dev/multimodal-extension-of-lesionlocator/blob/intermediate-fusion/lesionlocator/training/train_segment.py"
+click infer "https://github.com/matthieuasvazadourian-dev/multimodal-extension-of-lesionlocator/blob/intermediate-fusion/lesionlocator/inference/lesionlocator_segment_and_track.py"
+click masks "https://github.com/matthieuasvazadourian-dev/multimodal-extension-of-lesionlocator/blob/intermediate-fusion/lesionlocator/inference/export_prediction.py"
+click metrics "https://github.com/matthieuasvazadourian-dev/multimodal-extension-of-lesionlocator/blob/intermediate-fusion/lesionlocator/utilities/surface_distance_based_measures.py"
+click npz "https://github.com/matthieuasvazadourian-dev/multimodal-extension-of-lesionlocator/blob/intermediate-fusion/lesionlocator/inference/lesionlocator_segment_and_track_embed.py"
+click fusion "https://github.com/matthieuasvazadourian-dev/multimodal-extension-of-lesionlocator/blob/intermediate-fusion/lesionlocator/modules/multimodal_unet.py"
+click blocks "https://github.com/matthieuasvazadourian-dev/multimodal-extension-of-lesionlocator/blob/intermediate-fusion/lesionlocator/modules/fusion_modules.py"
+click tools "https://github.com/matthieuasvazadourian-dev/multimodal-extension-of-lesionlocator/blob/intermediate-fusion/lesionlocator/utilities/benchmark_fusion.py"
+click tests "https://github.com/matthieuasvazadourian-dev/multimodal-extension-of-lesionlocator/tree/intermediate-fusion/tests"
+click missing "https://github.com/matthieuasvazadourian-dev/multimodal-extension-of-lesionlocator/blob/intermediate-fusion/lesionlocator/utilities/route_by_modality.py"
+
+classDef tEntry fill:#ffe4e6,stroke:#e11d48,stroke-width:2px,color:#881337
+classDef tIn    fill:#f1f5f9,stroke:#475569,stroke-width:1.5px,color:#0f172a
+classDef tPipe  fill:#fef3c7,stroke:#d97706,stroke-width:1.5px,color:#78350f
+classDef tModel fill:#e0e7ff,stroke:#4f46e5,stroke-width:1.5px,color:#312e81
+classDef tRun   fill:#dcfce7,stroke:#16a34a,stroke-width:1.5px,color:#14532d
+classDef tOut   fill:#dbeafe,stroke:#2563eb,stroke-width:1.5px,color:#172554
+classDef tSide  fill:#ccfbf1,stroke:#0f766e,stroke-width:1.5px,color:#134e4a
+class entry tEntry
+class study,ckpt tIn
+class io,prep,prompt tPipe
+class train,infer tRun
+class masks,metrics,npz tOut
+class fusion,net,tracknet,blocks tModel
+class tools,tests,missing tSide
+```
+
+
 Folders in  `lesionlocator/`:
 
 ---
