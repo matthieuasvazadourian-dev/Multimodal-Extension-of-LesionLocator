@@ -2,11 +2,12 @@
 
 This repository builds upon and adapts the code from:
 
- [LesionLocator](https://github.com/MIC-DKFZ/LesionLocator) (Rokuss et al., CVPR 2025)
-via the LETITIA fork (X. Chen, SDSC/EPFL).
+ [LesionLocator](https://github.com/MIC-DKFZ/LesionLocator) (Rokuss et al., CVPR 2025), the original code,
 
 > **Authors**: Maximilian Rokuss, Yannick Kirchhoff, Seval Akbal, Balint Kovacs, Saikat Roy, Constantin Ulrich, Tassilo Wald, Lukas T. Rotkopf, Heinz-Peter Schlemmer and Klaus Maier-Hein  
 > **Paper**: [![CVPR](https://img.shields.io/badge/%20CVPR%202025%20-open%20access-blue.svg)](https://openaccess.thecvf.com/content/CVPR2025/html/Rokuss_LesionLocator_Zero-Shot_Universal_Tumor_Segmentation_and_Tracking_in_3D_Whole-Body_CVPR_2025_paper.html)
+
+and [PET-CT Adaptation](https://gitlab.datascience.ch/xiaoran/lesionlocator) (X. Chen, SDSC), its adaption for PET and CT imaging in the context of the LETITIA project.
 
 The fusion architectures are informed by:
 
