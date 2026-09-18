@@ -22,7 +22,6 @@ The fusion architectures are informed by:
 > **Paper**: [![CVPR](https://img.shields.io/badge/%20CVPR%202023%20-open%20access-blue.svg)](https://openaccess.thecvf.com/content/CVPR2023/html/Wang_Multi-Modal_Learning_With_Missing_Modality_via_Shared-Specific_Feature_Modelling_CVPR_2023_paper.html)
 
 ---
-
 ## Branches
 
 | Branch | Strategy | How it works |
@@ -48,6 +47,99 @@ pip install -e .
 ---
 
 ## Codebase
+
+### Chart of Early Fusion Architecture
+```mermaid
+flowchart TD
+
+%% ───────────────────────────────────────────────
+%%  ==>  data flows this way
+%%  ..>  configures / observes
+%%  Nodes are components, not files. Click one to
+%%  open the code it stands for.
+%% ───────────────────────────────────────────────
+
+  entry["Entry points<br/><i>scripts/ wraps each run</i><br/>train · segment · track · track_embed"]
+
+subgraph IN["1 · Input"]
+  study["Paired PET/CT study<br/>CT = _0000 · PET = _0001<br/>+ lesion prompt"]
+  ckpt["CT-pretrained LesionLocator<br/>checkpoint"]
+end
+
+subgraph PIPE["2 · Data pipeline"]
+  io["Read &amp; align<br/><i>CT defines the reference grid;</i><br/><i>PET and labels resampled onto it</i>"]
+  prep["Preprocess<br/>CT intensity window · PET z-score<br/>resample · crop · patch"]
+  prompt["Prompt channel<br/>point · box · previous mask"]
+end
+
+subgraph MODEL["3 · Model"]
+  fusion["<b>Early fusion</b><br/>PET enters as an extra input channel<br/>input conv widened 2 to 3,<br/>PET filter initialised from CT"]
+  net["Segmentation network<br/>residual-encoder U-Net"]
+  tracknet["TrackNet<br/>registers consecutive timepoints"]
+end
+
+subgraph RUN["4 · Execution"]
+  train["Fine-tuning<br/>CE + Dice loss<br/>patient-grouped cross-validation"]
+  infer["Inference<br/>sliding window over the volume"]
+end
+
+subgraph OUT["5 · Output"]
+  masks["Lesion masks"]
+  metrics["Dice · NSD · Hausdorff<br/>lesion detection rate"]
+  npz["Per-lesion embeddings <i>(.npz)</i><br/>features + dice + centroid + bbox"]
+end
+
+entry ==>|"runs"| train
+entry ==>|"runs"| infer
+
+study ==> io
+study ==>|"prompt files"| prompt
+io ==> prep
+
+prep ==>|"CT + PET channels"| fusion
+prompt ==>|"prompt channel"| fusion
+ckpt -.->|"pretrained weights"| fusion
+fusion ==> net
+
+train -.->|"updates weights"| net
+infer -.->|"forward passes"| net
+net ==>|"predictions"| masks
+masks ==> metrics
+
+masks -.->|"mask from the previous timepoint"| tracknet
+tracknet ==>|"warped mask becomes the next prompt"| prompt
+net -.->|"features captured by forward hooks<br/>track_embed only"| npz
+
+click entry "https://github.com/matthieuasvazadourian-dev/multimodal-extension-of-lesionlocator/tree/main/scripts"
+click study "https://github.com/matthieuasvazadourian-dev/multimodal-extension-of-lesionlocator/blob/main/readme.md"
+click ckpt "https://github.com/matthieuasvazadourian-dev/multimodal-extension-of-lesionlocator/blob/main/readme.md"
+click io "https://github.com/matthieuasvazadourian-dev/multimodal-extension-of-lesionlocator/blob/main/lesionlocator/imageio/simpleitk_reader_writer.py"
+click prep "https://github.com/matthieuasvazadourian-dev/multimodal-extension-of-lesionlocator/tree/main/lesionlocator/preprocessing"
+click prompt "https://github.com/matthieuasvazadourian-dev/multimodal-extension-of-lesionlocator/tree/main/lesionlocator/utilities/prompt_handling"
+click net "https://github.com/matthieuasvazadourian-dev/multimodal-extension-of-lesionlocator/blob/main/lesionlocator/utilities/get_network_from_plans.py"
+click tracknet "https://github.com/matthieuasvazadourian-dev/multimodal-extension-of-lesionlocator/blob/main/lesionlocator/modules/tracknet.py"
+click train "https://github.com/matthieuasvazadourian-dev/multimodal-extension-of-lesionlocator/blob/main/lesionlocator/training/train_segment.py"
+click infer "https://github.com/matthieuasvazadourian-dev/multimodal-extension-of-lesionlocator/blob/main/lesionlocator/inference/lesionlocator_segment_and_track.py"
+click masks "https://github.com/matthieuasvazadourian-dev/multimodal-extension-of-lesionlocator/blob/main/lesionlocator/inference/export_prediction.py"
+click metrics "https://github.com/matthieuasvazadourian-dev/multimodal-extension-of-lesionlocator/blob/main/lesionlocator/utilities/surface_distance_based_measures.py"
+click npz "https://github.com/matthieuasvazadourian-dev/multimodal-extension-of-lesionlocator/blob/main/lesionlocator/inference/lesionlocator_segment_and_track_embed.py"
+click fusion "https://github.com/matthieuasvazadourian-dev/multimodal-extension-of-lesionlocator/blob/main/lesionlocator/training/train_segment.py"
+
+classDef tEntry fill:#ffe4e6,stroke:#e11d48,stroke-width:2px,color:#881337
+classDef tIn    fill:#f1f5f9,stroke:#475569,stroke-width:1.5px,color:#0f172a
+classDef tPipe  fill:#fef3c7,stroke:#d97706,stroke-width:1.5px,color:#78350f
+classDef tModel fill:#e0e7ff,stroke:#4f46e5,stroke-width:1.5px,color:#312e81
+classDef tRun   fill:#dcfce7,stroke:#16a34a,stroke-width:1.5px,color:#14532d
+classDef tOut   fill:#dbeafe,stroke:#2563eb,stroke-width:1.5px,color:#172554
+classDef tSide  fill:#ccfbf1,stroke:#0f766e,stroke-width:1.5px,color:#134e4a
+class entry tEntry
+class study,ckpt tIn
+class io,prep,prompt tPipe
+class train,infer tRun
+class masks,metrics,npz tOut
+class fusion,net,tracknet tModel
+```
+
 
 Folders in  `lesionlocator/`:
 
